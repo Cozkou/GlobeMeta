@@ -245,7 +245,7 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     sceneRef.current = state;
 
     // Load country borders
-    fetch('https://unpkg.com/world-atlas@2/countries-50m.json')
+    fetch('https://unpkg.com/world-atlas@2/countries-10m.json')
       .then(r => r.json())
       .then(topoData => {
         const countries = feature(topoData, topoData.objects.countries) as any;
