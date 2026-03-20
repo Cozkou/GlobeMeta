@@ -1,6 +1,6 @@
 const Anthropic = require('@anthropic-ai/sdk');
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const client = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
 
 async function parseUserIntent(message) {
   const response = await client.messages.create({

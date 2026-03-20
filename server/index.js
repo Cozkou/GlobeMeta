@@ -80,17 +80,21 @@ app.get('/api/country/:code', async (req, res) => {
 app.post('/api/create-playlist', async (req, res) => {
   try {
     const { countryCode } = req.body;
-    const countryData = globeData[countryCode?.toUpperCase()];
+    const code = countryCode?.toUpperCase();
+    if (!globeData[code]) await refreshCountryData(code);
+    const countryData = globeData[code];
     if (!countryData) return res.status(404).json({ error: 'No data for this country' });
 
     const details = await generatePlaylistDetails(countryData.country, countryData.tracks);
     const trackUris = countryData.tracks.map(t => `spotify:track:${t.id}`);
     const url = await createPlaylist(details.name, details.description, trackUris);
+    const trackList = countryData.tracks.slice(0, 10).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`);
 
-    res.json({ url, name: details.name });
+    res.json({ url, name: details.name, description: details.description, tracks: trackList });
   } catch (err) {
-    console.error('Create playlist error:', err.message);
-    res.status(500).json({ error: 'Failed to create playlist' });
+    const detail = err.response?.data || err.message;
+    console.error('Create playlist error:', detail);
+    res.status(500).json({ error: typeof detail === 'string' ? detail : JSON.stringify(detail) });
   }
 });
 
@@ -102,31 +106,32 @@ app.post('/api/chat', async (req, res) => {
     const intent = await parseUserIntent(message);
     const code = intent.countryCode || countryCode?.toUpperCase();
 
-    if (intent.intent === 'create_playlist' && code) {
+    if ((intent.intent === 'create_playlist' || intent.intent === 'get_trending' || intent.intent === 'get_vibe') && code) {
+      if (!globeData[code]) await refreshCountryData(code);
       const cd = globeData[code];
-      if (!cd) return res.json({ reply: "I don't have data for that country yet." });
+      if (!cd) return res.json({ reply: "I couldn't find music data for that country. Try a different one!" });
 
-      const details = await generatePlaylistDetails(cd.country, cd.tracks);
-      const trackUris = cd.tracks.map(t => `spotify:track:${t.id}`);
-      const url = await createPlaylist(details.name, details.description, trackUris);
+      if (intent.intent === 'create_playlist') {
+        const details = await generatePlaylistDetails(cd.country, cd.tracks);
+        const trackUris = cd.tracks.map(t => `spotify:track:${t.id}`);
+        const url = await createPlaylist(details.name, details.description, trackUris);
+        const trackList = cd.tracks.slice(0, 10).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
 
-      return res.json({ reply: `${details.message}\n\n🎵 ${details.name}`, url });
-    }
+        return res.json({
+          reply: `${details.message}\n\n🎵 ${details.name}\n\n${trackList}`,
+          url,
+          tracks: cd.tracks,
+          playlistName: details.name,
+        });
+      }
 
-    if (intent.intent === 'get_trending' && code) {
-      const cd = globeData[code];
-      if (!cd) return res.json({ reply: 'No data yet for this country.' });
-
-      const top3 = cd.tracks.slice(0, 3).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
-      return res.json({ reply: `🔥 Trending:\n${top3}` });
-    }
-
-    if (intent.intent === 'get_vibe' && code) {
-      const cd = globeData[code];
-      if (!cd) return res.json({ reply: 'No data yet for this country.' });
+      if (intent.intent === 'get_trending') {
+        const trackList = cd.tracks.slice(0, 5).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
+        return res.json({ reply: `🔥 Trending in ${cd.country}:\n${trackList}`, tracks: cd.tracks });
+      }
 
       return res.json({
-        reply: `The vibe right now: Energy ${Math.round(cd.energy * 100)}% · Dance ${Math.round(cd.danceability * 100)}% · Valence ${Math.round(cd.valence * 100)}%`,
+        reply: `The vibe in ${cd.country} right now:\n⚡ Energy ${Math.round(cd.energy * 100)}%\n💃 Danceability ${Math.round(cd.danceability * 100)}%\n😊 Valence ${Math.round(cd.valence * 100)}%`,
       });
     }
 
@@ -134,8 +139,9 @@ app.post('/api/chat', async (req, res) => {
       reply: 'Try asking me:\n• "Make me a playlist from here"\n• "What\'s trending?"\n• "What\'s the vibe?"',
     });
   } catch (err) {
-    console.error('Chat error:', err.message);
-    res.status(500).json({ reply: 'Something went wrong, try again.' });
+    const detail = err.response?.data || err.message;
+    console.error('Chat error:', detail);
+    res.status(500).json({ reply: `Something went wrong: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}` });
   }
 });
 
@@ -150,28 +156,26 @@ app.post('/webhook/luffa', async (req, res) => {
     const intent = await parseUserIntent(message);
     console.log('Intent:', intent);
 
-    if (intent.intent === 'create_playlist' && intent.countryCode) {
+    if ((intent.intent === 'create_playlist' || intent.intent === 'get_trending') && intent.countryCode) {
+      if (!globeData[intent.countryCode]) await refreshCountryData(intent.countryCode);
       const countryData = globeData[intent.countryCode];
-      
+
       if (!countryData) {
-        await sendLuffaMessage(userId || groupId, `I don't have data for ${intent.country} yet, try again in a moment!`);
+        await sendLuffaMessage(userId || groupId, `I couldn't find music data for ${intent.country || 'that country'}. Try a different one!`);
         return;
       }
 
-      const details = await generatePlaylistDetails(intent.country, countryData.tracks);
-      const trackUris = countryData.tracks.map(t => `spotify:track:${t.id}`);
-      const playlistUrl = await createPlaylist(details.name, details.description, trackUris);
+      if (intent.intent === 'create_playlist') {
+        const details = await generatePlaylistDetails(countryData.country, countryData.tracks);
+        const trackUris = countryData.tracks.map(t => `spotify:track:${t.id}`);
+        const playlistUrl = await createPlaylist(details.name, details.description, trackUris);
+        const trackList = countryData.tracks.slice(0, 10).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
 
-      await sendLuffaMessage(userId || groupId, `${details.message}\n\n🎵 ${details.name}\n${playlistUrl}`);
-
-    } else if (intent.intent === 'get_trending' && intent.countryCode) {
-      const countryData = globeData[intent.countryCode];
-      if (!countryData) {
-        await sendLuffaMessage(userId || groupId, `No data yet for ${intent.country}!`);
-        return;
+        await sendLuffaMessage(userId || groupId, `${details.message}\n\n🎵 ${details.name}\n${playlistUrl}\n\n${trackList}`);
+      } else {
+        const trackList = countryData.tracks.slice(0, 5).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
+        await sendLuffaMessage(userId || groupId, `🔥 Trending in ${countryData.country}:\n${trackList}\n\nView the full globe: https://globe-meta.vercel.app`);
       }
-      const top3 = countryData.tracks.slice(0, 3).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
-      await sendLuffaMessage(userId || groupId, `🔥 Trending in ${intent.country}:\n${top3}\n\nView the full globe: https://globe-meta.vercel.app`);
 
     } else {
       await sendLuffaMessage(userId || groupId, `Try asking me:\n• "Make me a playlist from Brazil"\n• "What's trending in Japan?"\n• "What's the vibe in Nigeria?"`);
