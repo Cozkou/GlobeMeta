@@ -146,7 +146,7 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     scene.add(globe);
 
     // Grid lines (longitude/latitude)
-    const gridMat = new THREE.LineBasicMaterial({ color: 0x1a1a3e, transparent: true, opacity: 0.25 });
+    const gridMat = new THREE.LineBasicMaterial({ color: GRID_COLOR, transparent: true, opacity: 0.45 });
     for (let i = 0; i < 18; i++) {
       const curve = new THREE.EllipseCurve(0, 0, GLOBE_RADIUS + 0.002, GLOBE_RADIUS + 0.002, 0, Math.PI * 2, false, 0);
       const points2d = curve.getPoints(64);
