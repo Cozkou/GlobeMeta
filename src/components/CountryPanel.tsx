@@ -105,6 +105,7 @@ const CountryPanel = ({ data, onClose, isClosing }: CountryPanelProps) => {
           Open in Spotify
         </button>
       </div>
+      </div>
     </div>
   );
 };
