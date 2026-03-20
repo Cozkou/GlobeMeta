@@ -125,12 +125,12 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     controls.autoRotateSpeed = 0.5;
 
     // Lights
-    const ambient = new THREE.AmbientLight(0x444466, 1.2);
+    const ambient = new THREE.AmbientLight(0x8888bb, 2.0);
     scene.add(ambient);
-    const directional = new THREE.DirectionalLight(0x8888cc, 0.8);
+    const directional = new THREE.DirectionalLight(0xaaaaee, 1.2);
     directional.position.set(5, 3, 5);
     scene.add(directional);
-    const backLight = new THREE.DirectionalLight(0x334466, 0.4);
+    const backLight = new THREE.DirectionalLight(0x6666aa, 0.6);
     backLight.position.set(-5, -2, -5);
     scene.add(backLight);
 
