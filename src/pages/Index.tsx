@@ -72,7 +72,7 @@ const Index = () => {
       <GlobeScene ref={globeRef} onCountryClick={handleCountryClick} isPanelOpen={!!selectedCountry} />
 
       {/* Search bar */}
-      <div className="absolute top-16 left-1/2 -translate-x-1/2 z-40 w-full max-w-md px-4">
+      <div className="absolute top-16 left-1/2 -translate-x-1/2 z-40 w-full max-w-xs px-4">
         <div
           className="relative flex items-center rounded-xl transition-all duration-300"
           style={{
