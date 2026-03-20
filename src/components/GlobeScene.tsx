@@ -272,10 +272,26 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     };
     sceneRef.current = state;
 
-    // Load countries — use 110m for perf, still looks good
+    const textureLoader = new THREE.TextureLoader();
+    textureLoader.crossOrigin = 'anonymous';
+    const textureCache = new Map<string, THREE.Texture | null>();
+
+    function loadFlagTexture(code: string): Promise<THREE.Texture | null> {
+      if (textureCache.has(code)) return Promise.resolve(textureCache.get(code)!);
+      return new Promise(resolve => {
+        textureLoader.load(
+          `https://flagcdn.com/w320/${code}.png`,
+          tex => { tex.minFilter = THREE.LinearFilter; textureCache.set(code, tex); resolve(tex); },
+          undefined,
+          () => { textureCache.set(code, null); resolve(null); },
+        );
+      });
+    }
+
+    // Load countries
     fetch('https://unpkg.com/world-atlas@2/countries-110m.json')
       .then(r => r.json())
-      .then(topoData => {
+      .then(async topoData => {
         const countries = feature(topoData, topoData.objects.countries) as any;
 
         const borderMat = new THREE.LineBasicMaterial({
@@ -284,9 +300,16 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
           opacity: 0.6,
         });
 
-        countries.features.forEach((feat: any) => {
+        // Batch flag loading
+        const featureList = countries.features as any[];
+        const codes = featureList.map((f: any) => ID_TO_CODE[f.id?.toString()] || null);
+        const uniqueCodes = [...new Set(codes.filter(Boolean))] as string[];
+        await Promise.all(uniqueCodes.map(c => loadFlagTexture(c)));
+
+        featureList.forEach((feat: any, idx: number) => {
           const id = feat.id?.toString();
           const name = feat.properties?.name || ID_TO_NAME[id] || `Country ${id}`;
+          const code = codes[idx];
           const baseColor = getCountryColor(name);
           const hoverColor = getCountryHoverColor(name);
 
@@ -297,38 +320,57 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
 
           const countryData: CountryMeshData = { name, meshes: [], lines: [], baseColor, hoverColor };
 
-          // Batch all rings into one geometry per country
           const allVerts: number[] = [];
+          const allLngLat: [number, number][] = [];
+
           rings.forEach(ring => {
             const pts = coordsToPoints(ring, GLOBE_RADIUS + 0.002);
             if (pts.length < 3) return;
 
-            // Border line
             const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
             const line = new THREE.Line(lineGeo, borderMat);
             countryGroup.add(line);
             countryData.lines.push(line);
 
-            // Fan triangulation into single buffer
             for (let i = 1; i < pts.length - 1; i++) {
-              allVerts.push(
-                pts[0].x, pts[0].y, pts[0].z,
-                pts[i].x, pts[i].y, pts[i].z,
-                pts[i + 1].x, pts[i + 1].y, pts[i + 1].z,
-              );
+              allVerts.push(pts[0].x, pts[0].y, pts[0].z);
+              allLngLat.push([ring[0][0], ring[0][1]]);
+              allVerts.push(pts[i].x, pts[i].y, pts[i].z);
+              allLngLat.push([ring[i][0], ring[i][1]]);
+              const ni = i + 1 < ring.length ? i + 1 : i;
+              allVerts.push(pts[ni].x, pts[ni].y, pts[ni].z);
+              allLngLat.push([ring[ni][0], ring[ni][1]]);
             }
           });
 
           if (allVerts.length > 0) {
+            // Compute UV bounding box
+            let minLng = Infinity, maxLng = -Infinity, minLat = Infinity, maxLat = -Infinity;
+            for (const [lng, lat] of allLngLat) {
+              if (lng < minLng) minLng = lng;
+              if (lng > maxLng) maxLng = lng;
+              if (lat < minLat) minLat = lat;
+              if (lat > maxLat) maxLat = lat;
+            }
+            const lngRange = maxLng - minLng || 1;
+            const latRange = maxLat - minLat || 1;
+
+            const uvs = new Float32Array(allLngLat.length * 2);
+            for (let i = 0; i < allLngLat.length; i++) {
+              uvs[i * 2] = (allLngLat[i][0] - minLng) / lngRange;
+              uvs[i * 2 + 1] = (allLngLat[i][1] - minLat) / latRange;
+            }
+
             const geo = new THREE.BufferGeometry();
             geo.setAttribute('position', new THREE.Float32BufferAttribute(allVerts, 3));
+            geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
             geo.computeVertexNormals();
-            const mat = new THREE.MeshBasicMaterial({
-              color: baseColor,
-              transparent: true,
-              opacity: 0.7,
-              side: THREE.DoubleSide,
-            });
+
+            const flagTex = code ? textureCache.get(code) : null;
+            const mat = flagTex
+              ? new THREE.MeshBasicMaterial({ map: flagTex, transparent: true, opacity: 0.85, side: THREE.DoubleSide })
+              : new THREE.MeshBasicMaterial({ color: baseColor, transparent: true, opacity: 0.7, side: THREE.DoubleSide });
+
             const mesh = new THREE.Mesh(geo, mat);
             countryGroup.add(mesh);
             countryData.meshes.push(mesh);
