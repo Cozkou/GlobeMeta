@@ -98,90 +98,101 @@ app.post('/api/create-playlist', async (req, res) => {
   }
 });
 
-app.post('/api/chat', async (req, res) => {
-  try {
-    const { message, countryCode } = req.body;
-    if (!message) return res.status(400).json({ error: 'No message' });
+const PUBLIC_APP_URL = (process.env.PUBLIC_APP_URL || 'https://globe-meta.vercel.app').replace(/\/$/, '');
 
-    const intent = await parseUserIntent(message);
-    const code = intent.countryCode || countryCode?.toUpperCase();
+/**
+ * Shared path: parse intent → fetch Spotify top tracks for country → playlist / trending / vibe.
+ * @param {string} messageText - user message
+ * @param {string|null} fallbackCountryCode - optional 2-letter code when the model omits country (unused by Luffa)
+ * @returns {{ text: string }}
+ */
+async function processMusicBotMessage(messageText, fallbackCountryCode = null) {
+  const intent = await parseUserIntent(messageText);
+  const code = (intent.countryCode || fallbackCountryCode || '').toUpperCase() || null;
 
-    if ((intent.intent === 'create_playlist' || intent.intent === 'get_trending' || intent.intent === 'get_vibe') && code) {
-      if (!globeData[code]) await refreshCountryData(code);
-      const cd = globeData[code];
-      if (!cd) return res.json({ reply: "I couldn't find music data for that country. Try a different one!" });
-
-      if (intent.intent === 'create_playlist') {
-        const details = await generatePlaylistDetails(cd.country, cd.tracks);
-        const trackUris = cd.tracks.map(t => `spotify:track:${t.id}`);
-        const url = await createPlaylist(details.name, details.description, trackUris);
-        const trackList = cd.tracks.slice(0, 10).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
-
-        return res.json({
-          reply: `${details.message}\n\n🎵 ${details.name}\n\n${trackList}`,
-          url,
-          tracks: cd.tracks,
-          playlistName: details.name,
-        });
-      }
-
-      if (intent.intent === 'get_trending') {
-        const trackList = cd.tracks.slice(0, 5).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
-        return res.json({ reply: `🔥 Trending in ${cd.country}:\n${trackList}`, tracks: cd.tracks });
-      }
-
-      return res.json({
-        reply: `The vibe in ${cd.country} right now:\n⚡ Energy ${Math.round(cd.energy * 100)}%\n💃 Danceability ${Math.round(cd.danceability * 100)}%\n😊 Valence ${Math.round(cd.valence * 100)}%`,
-      });
+  if ((intent.intent === 'create_playlist' || intent.intent === 'get_trending' || intent.intent === 'get_vibe') && code) {
+    if (!globeData[code]) await refreshCountryData(code);
+    const cd = globeData[code];
+    if (!cd) {
+      return { text: `I couldn't find music data for ${intent.country || 'that country'}. Try a different one!` };
     }
 
-    return res.json({
-      reply: 'Try asking me:\n• "Make me a playlist from here"\n• "What\'s trending?"\n• "What\'s the vibe?"',
-    });
-  } catch (err) {
-    const detail = err.response?.data || err.message;
-    console.error('Chat error:', detail);
-    res.status(500).json({ reply: `Something went wrong: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}` });
+    if (intent.intent === 'create_playlist') {
+      const details = await generatePlaylistDetails(cd.country, cd.tracks);
+      const trackUris = cd.tracks.map(t => `spotify:track:${t.id}`);
+      const playlistUrl = await createPlaylist(details.name, details.description, trackUris);
+      const trackList = cd.tracks.slice(0, 10).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
+      return {
+        text: `${details.message}\n\n🎵 ${details.name}\n${playlistUrl}\n\n${trackList}`,
+      };
+    }
+
+    if (intent.intent === 'get_trending') {
+      const trackList = cd.tracks.slice(0, 5).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
+      return {
+        text: `🔥 Trending in ${cd.country}:\n${trackList}\n\nExplore the globe: ${PUBLIC_APP_URL}/globe`,
+      };
+    }
+
+    return {
+      text: `The vibe in ${cd.country} right now:\n⚡ Energy ${Math.round(cd.energy * 100)}%\n💃 Danceability ${Math.round(cd.danceability * 100)}%\n😊 Valence ${Math.round(cd.valence * 100)}%\n\n${PUBLIC_APP_URL}/globe`,
+    };
   }
-});
 
-// Luffa webhook
+  return {
+    text: `Try asking me:\n• "Make me a playlist from Brazil"\n• "What's trending in Japan?"\n• "What's the vibe in Nigeria?"`,
+  };
+}
+
+function extractLuffaWebhookPayload(body) {
+  if (!body || typeof body !== 'object') return { text: '', recipientId: null };
+  const text =
+    body.message ??
+    body.text ??
+    body.content ??
+    (body.msg && (body.msg.text ?? body.msg.content)) ??
+    '';
+  const recipientId =
+    body.userId ??
+    body.uid ??
+    body.user_id ??
+    body.groupId ??
+    body.group_id ??
+    body.recipientId ??
+    body.from ??
+    null;
+  return { text: String(text).trim(), recipientId };
+}
+
+// Luffa: point your bot webhook URL here (e.g. https://your-host/webhook/luffa)
 app.post('/webhook/luffa', async (req, res) => {
-  res.sendStatus(200); // always respond immediately
+  res.sendStatus(200);
 
-  const { message, userId, groupId } = req.body;
-  if (!message) return;
+  const { text, recipientId } = extractLuffaWebhookPayload(req.body);
+  if (!text) {
+    console.warn('Luffa webhook: empty message', JSON.stringify(req.body).slice(0, 200));
+    return;
+  }
+  if (!recipientId) {
+    console.warn('Luffa webhook: no recipient id in payload', JSON.stringify(req.body).slice(0, 200));
+    return;
+  }
+  if (!process.env.LUFFA_BOT_UID || !process.env.LUFFA_BOT_SECRET) {
+    console.error('Luffa webhook: set LUFFA_BOT_UID and LUFFA_BOT_SECRET to send replies');
+    return;
+  }
 
   try {
-    const intent = await parseUserIntent(message);
-    console.log('Intent:', intent);
-
-    if ((intent.intent === 'create_playlist' || intent.intent === 'get_trending') && intent.countryCode) {
-      if (!globeData[intent.countryCode]) await refreshCountryData(intent.countryCode);
-      const countryData = globeData[intent.countryCode];
-
-      if (!countryData) {
-        await sendLuffaMessage(userId || groupId, `I couldn't find music data for ${intent.country || 'that country'}. Try a different one!`);
-        return;
-      }
-
-      if (intent.intent === 'create_playlist') {
-        const details = await generatePlaylistDetails(countryData.country, countryData.tracks);
-        const trackUris = countryData.tracks.map(t => `spotify:track:${t.id}`);
-        const playlistUrl = await createPlaylist(details.name, details.description, trackUris);
-        const trackList = countryData.tracks.slice(0, 10).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
-
-        await sendLuffaMessage(userId || groupId, `${details.message}\n\n🎵 ${details.name}\n${playlistUrl}\n\n${trackList}`);
-      } else {
-        const trackList = countryData.tracks.slice(0, 5).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
-        await sendLuffaMessage(userId || groupId, `🔥 Trending in ${countryData.country}:\n${trackList}\n\nView the full globe: https://globe-meta.vercel.app`);
-      }
-
-    } else {
-      await sendLuffaMessage(userId || groupId, `Try asking me:\n• "Make me a playlist from Brazil"\n• "What's trending in Japan?"\n• "What's the vibe in Nigeria?"`);
-    }
+    const { text: reply } = await processMusicBotMessage(text, null);
+    console.log('Luffa reply length:', reply.length);
+    await sendLuffaMessage(recipientId, reply);
   } catch (err) {
-    console.error('Webhook error:', err.message);
+    console.error('Luffa webhook error:', err.message);
+    try {
+      await sendLuffaMessage(recipientId, 'Something went wrong fetching Spotify data. Try again in a moment.');
+    } catch (_) {
+      /* ignore */
+    }
   }
 });
 

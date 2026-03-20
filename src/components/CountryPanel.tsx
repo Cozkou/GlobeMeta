@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { X, Play, Pause, Loader2, Send, Music } from 'lucide-react';
+import { X, Play, Pause, Loader2, Music } from 'lucide-react';
 import { COUNTRY_NAME_TO_CODE, COUNTRY_META, resolveCountryCode } from '@/data/countryData';
 
 const API_BASE = 'http://localhost:4000';
@@ -37,11 +37,6 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
   const [data, setData] = useState<ApiCountryData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [playingId, setPlayingId] = useState<string | null>(null);
-  const [chatOpen, setChatOpen] = useState(false);
-  const [chatMsg, setChatMsg] = useState('');
-  const [chatReply, setChatReply] = useState<string | null>(null);
-  const [chatUrl, setChatUrl] = useState<string | null>(null);
-  const [chatLoading, setChatLoading] = useState(false);
   const [creatingPlaylist, setCreatingPlaylist] = useState(false);
   const [playlistResult, setPlaylistResult] = useState<{
     url: string;
@@ -92,9 +87,6 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
     setError(null);
     setData(null);
     setPlayingId(null);
-    setChatOpen(false);
-    setChatReply(null);
-    setChatUrl(null);
     setPlaylistResult(null);
 
     fetch(`${API_BASE}/api/country/${code}`)
@@ -167,29 +159,6 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
       setPlaylistResult({ url: '', name: '', tracks: [], error: 'Network error — is the server running?' });
     } finally {
       setCreatingPlaylist(false);
-    }
-  };
-
-  const handleChat = async () => {
-    if (!chatMsg.trim() || !code) return;
-    const msg = chatMsg;
-    setChatMsg('');
-    setChatLoading(true);
-    setChatReply(null);
-    setChatUrl(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: msg, countryCode: code }),
-      });
-      const json = await res.json();
-      setChatReply(json.reply);
-      if (json.url) setChatUrl(json.url);
-    } catch (_e) {
-      setChatReply('Something went wrong, try again.');
-    } finally {
-      setChatLoading(false);
     }
   };
 
@@ -369,65 +338,6 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
                       🎧 Open in Spotify
                     </a>
                   </>
-                )}
-              </div>
-            )}
-
-            <button
-              onClick={() => setChatOpen(prev => !prev)}
-              className="retro-title w-full flex items-center justify-center gap-2 rounded-sm py-3 text-[10px] font-semibold transition-colors cursor-pointer"
-              style={{
-                backgroundColor: 'hsla(var(--primary) / 0.12)',
-                color: 'hsl(var(--primary))',
-                border: '1px solid hsla(var(--primary) / 0.2)',
-              }}
-            >
-              💬 Ask Pulse Earth Vibes
-            </button>
-
-            {chatOpen && (
-              <div className="retro-panel mt-1 overflow-hidden border border-white/[0.06] bg-white/[0.03]">
-                <div className="flex items-center gap-2 p-3">
-                  <input
-                    type="text"
-                    value={chatMsg}
-                    onChange={e => setChatMsg(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && handleChat()}
-                    placeholder="e.g. make me a late night playlist…"
-                    className="retro-body flex-1 bg-transparent text-foreground placeholder-muted-foreground/40 outline-none"
-                    disabled={chatLoading}
-                  />
-                  <button
-                    onClick={handleChat}
-                    disabled={chatLoading || !chatMsg.trim()}
-                    className="w-7 h-7 flex items-center justify-center rounded-sm bg-white/[0.06] hover:bg-white/[0.12] transition-colors shrink-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed border border-white/15"
-                  >
-                    {chatLoading ? (
-                      <Loader2 size={12} className="animate-spin text-muted-foreground" />
-                    ) : (
-                      <Send size={12} className="text-muted-foreground" />
-                    )}
-                  </button>
-                </div>
-                {chatReply && (
-                  <div className="px-3 pb-3 flex flex-col gap-2">
-                    <p className="retro-body text-muted-foreground whitespace-pre-wrap leading-relaxed">{chatReply}</p>
-                    {chatUrl && (
-                      <a
-                        href={chatUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="retro-title flex items-center justify-center gap-2 rounded-sm py-2.5 text-[10px] font-semibold transition-colors"
-                        style={{
-                          backgroundColor: 'hsla(var(--spotify-green) / 0.15)',
-                          color: 'hsl(var(--spotify-green))',
-                          border: '1px solid hsla(var(--spotify-green) / 0.2)',
-                        }}
-                      >
-                        🎧 Open Playlist in Spotify
-                      </a>
-                    )}
-                  </div>
                 )}
               </div>
             )}
