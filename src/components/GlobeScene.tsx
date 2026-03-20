@@ -4,11 +4,11 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { feature } from 'topojson-client';
 
 const GLOBE_RADIUS = 1;
-const ATMOSPHERE_RADIUS = 1.14;
+const ATMOSPHERE_RADIUS = 1.08;
 const GLOBE_BG = '#0a0a0f';
-const OCEAN_COLOR = 0x0e0e28;
-const LAND_COLOR = 0x1a1a4a;
-const BORDER_COLOR = 0x4a4aaa;
+const OCEAN_COLOR = 0x080818;
+const LAND_COLOR = 0x2a2a6a;
+const BORDER_COLOR = 0x6060cc;
 const BORDER_HOVER_COLOR = 0x8888ff;
 const MARKER_COLOR = 0x7a7aff;
 const MARKER_HOVER_COLOR = 0xbbbbff;
@@ -162,9 +162,9 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     const globeGeo = new THREE.SphereGeometry(GLOBE_RADIUS, 96, 96);
     const globeMat = new THREE.MeshPhongMaterial({
       color: OCEAN_COLOR,
-      emissive: 0x080820,
-      shininess: 20,
-      specular: 0x333366,
+      emissive: 0x040410,
+      shininess: 10,
+      specular: 0x222244,
     });
     const globe = new THREE.Mesh(globeGeo, globeMat);
     scene.add(globe);
@@ -186,8 +186,8 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
       fragmentShader: `
         varying vec3 vNormal;
         void main() {
-          float intensity = pow(0.72 - dot(vNormal, vec3(0.0, 0.0, 1.0)), 2.5);
-          gl_FragColor = vec4(0.3, 0.3, 0.65, 1.0) * intensity;
+          float intensity = pow(0.55 - dot(vNormal, vec3(0.0, 0.0, 1.0)), 3.0);
+          gl_FragColor = vec4(0.22, 0.22, 0.5, 1.0) * intensity;
         }
       `,
       blending: THREE.AdditiveBlending,
@@ -245,7 +245,7 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     sceneRef.current = state;
 
     // Load country borders
-    fetch('https://unpkg.com/world-atlas@2/countries-50m.json')
+    fetch('https://unpkg.com/world-atlas@2/countries-10m.json')
       .then(r => r.json())
       .then(topoData => {
         const countries = feature(topoData, topoData.objects.countries) as any;
@@ -260,7 +260,7 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
         const landMat = new THREE.MeshBasicMaterial({
           color: LAND_COLOR,
           transparent: true,
-          opacity: 0.6,
+          opacity: 0.75,
           side: THREE.DoubleSide,
         });
 
