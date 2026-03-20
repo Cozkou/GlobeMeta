@@ -162,9 +162,9 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     const globeGeo = new THREE.SphereGeometry(GLOBE_RADIUS, 96, 96);
     const globeMat = new THREE.MeshPhongMaterial({
       color: OCEAN_COLOR,
-      emissive: 0x080820,
-      shininess: 20,
-      specular: 0x333366,
+      emissive: 0x040410,
+      shininess: 10,
+      specular: 0x222244,
     });
     const globe = new THREE.Mesh(globeGeo, globeMat);
     scene.add(globe);
