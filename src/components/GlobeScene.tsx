@@ -4,43 +4,109 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { feature } from 'topojson-client';
 
 const GLOBE_RADIUS = 1;
-const ATMOSPHERE_RADIUS = 1.08;
 const GLOBE_BG = '#0a0a0f';
-const OCEAN_COLOR = 0x080818;
-const LAND_COLOR = 0x2a2a6a;
-const BORDER_COLOR = 0x6060cc;
-const BORDER_HOVER_COLOR = 0x8888ff;
-const MARKER_COLOR = 0x7a7aff;
-const MARKER_HOVER_COLOR = 0xbbbbff;
+const OCEAN_COLOR = 0x060612;
+const BORDER_COLOR = 0x5858bb;
+const DEFAULT_LAND_COLOR = 0x1e1e55;
 
-// Country center positions for markers
-const COUNTRY_MARKERS: { name: string; lat: number; lng: number }[] = [
-  { name: 'United States of America', lat: 39.8, lng: -98.6 },
-  { name: 'Brazil', lat: -14.2, lng: -51.9 },
-  { name: 'United Kingdom', lat: 54.0, lng: -2.0 },
-  { name: 'France', lat: 46.6, lng: 2.2 },
-  { name: 'Germany', lat: 51.2, lng: 10.4 },
-  { name: 'Nigeria', lat: 9.1, lng: 8.7 },
-  { name: 'India', lat: 20.6, lng: 79.0 },
-  { name: 'Japan', lat: 36.2, lng: 138.3 },
-  { name: 'Australia', lat: -25.3, lng: 133.8 },
-  { name: 'South Korea', lat: 35.9, lng: 127.8 },
-  { name: 'Russia', lat: 61.5, lng: 105.3 },
-  { name: 'Canada', lat: 56.1, lng: -106.3 },
-  { name: 'Mexico', lat: 23.6, lng: -102.6 },
-  { name: 'Argentina', lat: -38.4, lng: -63.6 },
-  { name: 'South Africa', lat: -30.6, lng: 22.9 },
-  { name: 'Egypt', lat: 26.8, lng: 30.8 },
-  { name: 'China', lat: 35.9, lng: 104.2 },
-  { name: 'Indonesia', lat: -0.8, lng: 113.9 },
-  { name: 'Turkey', lat: 39.0, lng: 35.2 },
-  { name: 'Italy', lat: 41.9, lng: 12.6 },
-  { name: 'Spain', lat: 40.5, lng: -3.7 },
-  { name: 'Colombia', lat: 4.6, lng: -74.3 },
-  { name: 'Kenya', lat: -0.02, lng: 37.9 },
-  { name: 'Thailand', lat: 15.9, lng: 101.0 },
-  { name: 'Sweden', lat: 60.1, lng: 18.6 },
-];
+// ID-to-name mapping for world-atlas numeric IDs (ISO 3166-1 numeric)
+const ID_TO_NAME: Record<string, string> = {
+  '004': 'Afghanistan', '008': 'Albania', '012': 'Algeria', '024': 'Angola',
+  '032': 'Argentina', '036': 'Australia', '040': 'Austria', '050': 'Bangladesh',
+  '056': 'Belgium', '068': 'Bolivia', '076': 'Brazil', '100': 'Bulgaria',
+  '104': 'Myanmar', '116': 'Cambodia', '120': 'Cameroon', '124': 'Canada',
+  '140': 'Central African Republic', '148': 'Chad', '152': 'Chile', '156': 'China',
+  '170': 'Colombia', '180': 'Dem. Rep. Congo', '188': 'Costa Rica', '191': 'Croatia',
+  '192': 'Cuba', '203': 'Czech Republic', '208': 'Denmark', '214': 'Dominican Republic',
+  '218': 'Ecuador', '818': 'Egypt', '222': 'El Salvador', '231': 'Ethiopia',
+  '246': 'Finland', '250': 'France', '276': 'Germany', '288': 'Ghana',
+  '300': 'Greece', '320': 'Guatemala', '324': 'Guinea', '332': 'Haiti',
+  '340': 'Honduras', '348': 'Hungary', '356': 'India', '360': 'Indonesia',
+  '364': 'Iran', '368': 'Iraq', '372': 'Ireland', '376': 'Israel',
+  '380': 'Italy', '384': 'Ivory Coast', '392': 'Japan', '400': 'Jordan',
+  '404': 'Kenya', '408': 'North Korea', '410': 'South Korea', '414': 'Kuwait',
+  '418': 'Laos', '422': 'Lebanon', '430': 'Liberia', '434': 'Libya',
+  '440': 'Lithuania', '458': 'Malaysia', '466': 'Mali', '484': 'Mexico',
+  '496': 'Mongolia', '504': 'Morocco', '508': 'Mozambique', '516': 'Namibia',
+  '524': 'Nepal', '528': 'Netherlands', '554': 'New Zealand', '558': 'Nicaragua',
+  '562': 'Niger', '566': 'Nigeria', '578': 'Norway', '586': 'Pakistan',
+  '591': 'Panama', '598': 'Papua New Guinea', '600': 'Paraguay', '604': 'Peru',
+  '608': 'Philippines', '616': 'Poland', '620': 'Portugal', '634': 'Qatar',
+  '642': 'Romania', '643': 'Russia', '682': 'Saudi Arabia', '686': 'Senegal',
+  '694': 'Sierra Leone', '702': 'Singapore', '703': 'Slovakia', '704': 'Vietnam',
+  '706': 'Somalia', '710': 'South Africa', '716': 'Zimbabwe', '724': 'Spain',
+  '736': 'Sudan', '740': 'Suriname', '752': 'Sweden', '756': 'Switzerland',
+  '760': 'Syria', '764': 'Thailand', '788': 'Tunisia', '792': 'Turkey',
+  '800': 'Uganda', '804': 'Ukraine', '784': 'United Arab Emirates',
+  '826': 'United Kingdom', '840': 'United States of America',
+  '858': 'Uruguay', '860': 'Uzbekistan', '862': 'Venezuela',
+  '887': 'Yemen', '894': 'Zambia', '729': 'Sudan',
+};
+
+// Energy-based color palette — maps country name to a hue
+const COUNTRY_HUES: Record<string, number> = {
+  'United States of America': 15,  // warm orange-red (High Energy)
+  'Brazil': 40,                     // golden yellow (Party)
+  'Japan': 200,                     // cool blue (Melancholic)
+  'Nigeria': 145,                   // teal-green (Afrobeats)
+  'France': 270,                    // purple (Dreamy)
+  'India': 330,                     // pink-magenta (Euphoric)
+  'Germany': 0,                     // red (Techno)
+  'Australia': 195,                 // ocean blue (Chill)
+  'South Korea': 320,               // hot pink (K-Pop)
+  'United Kingdom': 25,             // amber (Indie)
+  'Mexico': 50,                     // yellow-gold
+  'Canada': 210,                    // steel blue
+  'Argentina': 180,                 // cyan
+  'South Africa': 120,              // green
+  'Egypt': 35,                      // sandy orange
+  'China': 5,                       // red
+  'Indonesia': 155,                 // sea green
+  'Turkey': 10,                     // red-orange
+  'Italy': 350,                     // crimson
+  'Spain': 45,                      // warm yellow
+  'Colombia': 55,                   // golden
+  'Kenya': 130,                     // forest green
+  'Thailand': 165,                  // aqua
+  'Sweden': 220,                    // nordic blue
+  'Russia': 240,                    // deep blue
+  'Ukraine': 60,                    // wheat
+  'Poland': 350,                    // soft red
+  'Iran': 30,                       // amber
+  'Saudi Arabia': 110,              // olive green
+  'Peru': 170,                      // teal
+  'Chile': 290,                     // violet
+  'Venezuela': 55,                  // gold
+  'Cuba': 15,                       // warm
+  'Philippines': 305,               // orchid
+  'Vietnam': 140,                   // green
+  'Pakistan': 100,                  // lime
+  'Bangladesh': 90,                 // yellow-green
+  'Ethiopia': 75,                   // chartreuse
+  'Ghana': 80,                      // grass green
+};
+
+function getCountryColor(name: string): THREE.Color {
+  const hue = COUNTRY_HUES[name];
+  if (hue !== undefined) {
+    // Saturated, medium brightness — stands out from dark ocean
+    return new THREE.Color().setHSL(hue / 360, 0.55, 0.28);
+  }
+  // Default muted land color with slight random hue variation
+  const hash = name.split('').reduce((a, c) => a + c.charCodeAt(0), 0);
+  const h = (hash * 137) % 360;
+  return new THREE.Color().setHSL(h / 360, 0.3, 0.2);
+}
+
+function getCountryHoverColor(name: string): THREE.Color {
+  const hue = COUNTRY_HUES[name];
+  if (hue !== undefined) {
+    return new THREE.Color().setHSL(hue / 360, 0.65, 0.45);
+  }
+  const hash = name.split('').reduce((a, c) => a + c.charCodeAt(0), 0);
+  const h = (hash * 137) % 360;
+  return new THREE.Color().setHSL(h / 360, 0.4, 0.35);
+}
 
 function latLngToVec3(lat: number, lng: number, radius: number): THREE.Vector3 {
   const phi = (90 - lat) * (Math.PI / 180);
@@ -52,9 +118,16 @@ function latLngToVec3(lat: number, lng: number, radius: number): THREE.Vector3 {
   );
 }
 
-// Convert a GeoJSON coordinate ring to 3D points on the globe
 function coordsToPoints(coords: number[][], radius: number): THREE.Vector3[] {
   return coords.map(([lng, lat]) => latLngToVec3(lat, lng, radius));
+}
+
+interface CountryMeshData {
+  name: string;
+  meshes: THREE.Mesh[];
+  lines: THREE.Line[];
+  baseColor: THREE.Color;
+  hoverColor: THREE.Color;
 }
 
 interface GlobeProps {
@@ -69,13 +142,12 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     scene: THREE.Scene;
     camera: THREE.PerspectiveCamera;
     controls: OrbitControls;
-    markers: THREE.Mesh[];
-    markerNames: string[];
     globe: THREE.Mesh;
-    countryGroup: THREE.Group;
+    countryMeshes: THREE.Mesh[];
+    countryDataMap: Map<THREE.Mesh, CountryMeshData>;
     raycaster: THREE.Raycaster;
     mouse: THREE.Vector2;
-    hoveredMarker: THREE.Mesh | null;
+    hoveredCountry: CountryMeshData | null;
     frameId: number;
   } | null>(null);
   const [hoveredName, setHoveredName] = useState<string | null>(null);
@@ -89,30 +161,10 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
       s.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       s.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
       s.raycaster.setFromCamera(s.mouse, s.camera);
-      // Check markers first
-      const markerHits = s.raycaster.intersectObjects(s.markers);
-      if (markerHits.length > 0) {
-        const idx = s.markers.indexOf(markerHits[0].object as THREE.Mesh);
-        if (idx >= 0) onCountryClick(s.markerNames[idx]);
-        return;
-      }
-      // Check globe surface → find nearest country marker
-      const globeHits = s.raycaster.intersectObject(s.globe);
-      if (globeHits.length > 0) {
-        const point = globeHits[0].point.clone().normalize();
-        let closestIdx = -1;
-        let closestDist = Infinity;
-        s.markers.forEach((m, i) => {
-          const d = point.distanceTo(m.position.clone().normalize());
-          if (d < closestDist) {
-            closestDist = d;
-            closestIdx = i;
-          }
-        });
-        // Only trigger if close enough (within ~15 degrees)
-        if (closestIdx >= 0 && closestDist < 0.25) {
-          onCountryClick(s.markerNames[closestIdx]);
-        }
+      const hits = s.raycaster.intersectObjects(s.countryMeshes);
+      if (hits.length > 0) {
+        const data = s.countryDataMap.get(hits[0].object as THREE.Mesh);
+        if (data) onCountryClick(data.name);
       }
     },
     [onCountryClick]
@@ -122,7 +174,6 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     if (!containerRef.current) return;
     const container = containerRef.current;
 
-    // Renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
     renderer.setSize(container.clientWidth, container.clientHeight);
@@ -130,13 +181,7 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     container.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-
-    const camera = new THREE.PerspectiveCamera(
-      45,
-      container.clientWidth / container.clientHeight,
-      0.1,
-      100
-    );
+    const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
     camera.position.set(0, 0, 3.2);
 
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -149,103 +194,57 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     controls.autoRotateSpeed = 0.5;
 
     // Lights
-    const ambient = new THREE.AmbientLight(0x8888bb, 2.0);
-    scene.add(ambient);
-    const directional = new THREE.DirectionalLight(0xaaaaee, 1.2);
-    directional.position.set(5, 3, 5);
-    scene.add(directional);
-    const backLight = new THREE.DirectionalLight(0x6666aa, 0.6);
-    backLight.position.set(-5, -2, -5);
-    scene.add(backLight);
+    scene.add(new THREE.AmbientLight(0x8888bb, 2.0));
+    const dir = new THREE.DirectionalLight(0xaaaaee, 1.0);
+    dir.position.set(5, 3, 5);
+    scene.add(dir);
+    const back = new THREE.DirectionalLight(0x6666aa, 0.5);
+    back.position.set(-5, -2, -5);
+    scene.add(back);
 
     // Ocean sphere
-    const globeGeo = new THREE.SphereGeometry(GLOBE_RADIUS, 96, 96);
-    const globeMat = new THREE.MeshPhongMaterial({
-      color: OCEAN_COLOR,
-      emissive: 0x040410,
-      shininess: 10,
-      specular: 0x222244,
-    });
-    const globe = new THREE.Mesh(globeGeo, globeMat);
+    const globe = new THREE.Mesh(
+      new THREE.SphereGeometry(GLOBE_RADIUS, 64, 64),
+      new THREE.MeshPhongMaterial({ color: OCEAN_COLOR, emissive: 0x030310, shininess: 8, specular: 0x181838 })
+    );
     scene.add(globe);
 
-    // Country outlines group (populated async)
-    const countryGroup = new THREE.Group();
-    scene.add(countryGroup);
-
-    // Atmosphere glow
-    const atmosGeo = new THREE.SphereGeometry(ATMOSPHERE_RADIUS, 64, 64);
+    // Atmosphere
     const atmosMat = new THREE.ShaderMaterial({
-      vertexShader: `
-        varying vec3 vNormal;
-        void main() {
-          vNormal = normalize(normalMatrix * normal);
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        varying vec3 vNormal;
-        void main() {
-          float intensity = pow(0.55 - dot(vNormal, vec3(0.0, 0.0, 1.0)), 3.0);
-          gl_FragColor = vec4(0.22, 0.22, 0.5, 1.0) * intensity;
-        }
-      `,
+      vertexShader: `varying vec3 vN; void main(){vN=normalize(normalMatrix*normal);gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
+      fragmentShader: `varying vec3 vN; void main(){float i=pow(0.5-dot(vN,vec3(0,0,1)),3.0);gl_FragColor=vec4(0.2,0.2,0.45,1.0)*i;}`,
       blending: THREE.AdditiveBlending,
       side: THREE.BackSide,
       transparent: true,
     });
-    scene.add(new THREE.Mesh(atmosGeo, atmosMat));
-
-    // Country markers
-    const markers: THREE.Mesh[] = [];
-    const markerNames: string[] = [];
-    const markerGeo = new THREE.SphereGeometry(0.018, 16, 16);
-
-    COUNTRY_MARKERS.forEach(({ name, lat, lng }) => {
-      const pos = latLngToVec3(lat, lng, GLOBE_RADIUS + 0.012);
-      const mat = new THREE.MeshBasicMaterial({ color: MARKER_COLOR, transparent: true, opacity: 0.9 });
-      const marker = new THREE.Mesh(markerGeo, mat);
-      marker.position.copy(pos);
-      scene.add(marker);
-      markers.push(marker);
-      markerNames.push(name);
-
-      // Glow ring
-      const ringGeo = new THREE.RingGeometry(0.022, 0.035, 32);
-      const ringMat = new THREE.MeshBasicMaterial({
-        color: MARKER_COLOR,
-        transparent: true,
-        opacity: 0.35,
-        side: THREE.DoubleSide,
-      });
-      const ring = new THREE.Mesh(ringGeo, ringMat);
-      ring.position.copy(pos);
-      ring.lookAt(new THREE.Vector3(0, 0, 0));
-      scene.add(ring);
-    });
+    scene.add(new THREE.Mesh(new THREE.SphereGeometry(1.06, 48, 48), atmosMat));
 
     // Stars
+    const starsPos = new Float32Array(2000 * 3);
+    for (let i = 0; i < 2000 * 3; i++) starsPos[i] = (Math.random() - 0.5) * 80;
     const starsGeo = new THREE.BufferGeometry();
-    const starsPositions = new Float32Array(3000 * 3);
-    for (let i = 0; i < 3000 * 3; i++) {
-      starsPositions[i] = (Math.random() - 0.5) * 80;
-    }
-    starsGeo.setAttribute('position', new THREE.BufferAttribute(starsPositions, 3));
-    scene.add(new THREE.Points(starsGeo, new THREE.PointsMaterial({ color: 0x8888bb, size: 0.08, sizeAttenuation: true })));
+    starsGeo.setAttribute('position', new THREE.BufferAttribute(starsPos, 3));
+    scene.add(new THREE.Points(starsGeo, new THREE.PointsMaterial({ color: 0x7777aa, size: 0.06, sizeAttenuation: true })));
+
+    const countryGroup = new THREE.Group();
+    scene.add(countryGroup);
+
+    const countryMeshes: THREE.Mesh[] = [];
+    const countryDataMap = new Map<THREE.Mesh, CountryMeshData>();
 
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
 
     const state = {
-      renderer, scene, camera, controls, markers, markerNames, globe, countryGroup,
+      renderer, scene, camera, controls, globe, countryMeshes, countryDataMap,
       raycaster, mouse,
-      hoveredMarker: null as THREE.Mesh | null,
+      hoveredCountry: null as CountryMeshData | null,
       frameId: 0,
     };
     sceneRef.current = state;
 
-    // Load country borders
-    fetch('https://unpkg.com/world-atlas@2/countries-10m.json')
+    // Load countries — use 110m for perf, still looks good
+    fetch('https://unpkg.com/world-atlas@2/countries-110m.json')
       .then(r => r.json())
       .then(topoData => {
         const countries = feature(topoData, topoData.objects.countries) as any;
@@ -253,59 +252,64 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
         const borderMat = new THREE.LineBasicMaterial({
           color: BORDER_COLOR,
           transparent: true,
-          opacity: 0.7,
-          linewidth: 1,
-        });
-
-        const landMat = new THREE.MeshBasicMaterial({
-          color: LAND_COLOR,
-          transparent: true,
-          opacity: 0.75,
-          side: THREE.DoubleSide,
+          opacity: 0.6,
         });
 
         countries.features.forEach((feat: any) => {
+          const id = feat.id?.toString();
+          const name = feat.properties?.name || ID_TO_NAME[id] || `Country ${id}`;
+          const baseColor = getCountryColor(name);
+          const hoverColor = getCountryHoverColor(name);
+
           const geom = feat.geometry;
           const rings: number[][][] = [];
+          if (geom.type === 'Polygon') rings.push(...geom.coordinates);
+          else if (geom.type === 'MultiPolygon') geom.coordinates.forEach((p: number[][][]) => rings.push(...p));
 
-          if (geom.type === 'Polygon') {
-            rings.push(...geom.coordinates);
-          } else if (geom.type === 'MultiPolygon') {
-            geom.coordinates.forEach((poly: number[][][]) => {
-              rings.push(...poly);
-            });
-          }
+          const countryData: CountryMeshData = { name, meshes: [], lines: [], baseColor, hoverColor };
 
+          // Batch all rings into one geometry per country
+          const allVerts: number[] = [];
           rings.forEach(ring => {
-            // Border outline
-            const points = coordsToPoints(ring, GLOBE_RADIUS + 0.003);
-            if (points.length < 3) return;
-            const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+            const pts = coordsToPoints(ring, GLOBE_RADIUS + 0.002);
+            if (pts.length < 3) return;
+
+            // Border line
+            const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
             const line = new THREE.Line(lineGeo, borderMat);
             countryGroup.add(line);
+            countryData.lines.push(line);
 
-            // Land fill — use triangulation from fan for simple polygons
-            if (points.length > 3) {
-              const landPoints = coordsToPoints(ring, GLOBE_RADIUS + 0.001);
-              const vertices: number[] = [];
-              for (let i = 1; i < landPoints.length - 1; i++) {
-                vertices.push(
-                  landPoints[0].x, landPoints[0].y, landPoints[0].z,
-                  landPoints[i].x, landPoints[i].y, landPoints[i].z,
-                  landPoints[i + 1].x, landPoints[i + 1].y, landPoints[i + 1].z,
-                );
-              }
-              const fillGeo = new THREE.BufferGeometry();
-              fillGeo.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
-              fillGeo.computeVertexNormals();
-              const fillMesh = new THREE.Mesh(fillGeo, landMat);
-              countryGroup.add(fillMesh);
+            // Fan triangulation into single buffer
+            for (let i = 1; i < pts.length - 1; i++) {
+              allVerts.push(
+                pts[0].x, pts[0].y, pts[0].z,
+                pts[i].x, pts[i].y, pts[i].z,
+                pts[i + 1].x, pts[i + 1].y, pts[i + 1].z,
+              );
             }
           });
+
+          if (allVerts.length > 0) {
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(allVerts, 3));
+            geo.computeVertexNormals();
+            const mat = new THREE.MeshBasicMaterial({
+              color: baseColor,
+              transparent: true,
+              opacity: 0.7,
+              side: THREE.DoubleSide,
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+            countryGroup.add(mesh);
+            countryData.meshes.push(mesh);
+            countryMeshes.push(mesh);
+            countryDataMap.set(mesh, countryData);
+          }
         });
       });
 
-    // Mouse move
+    // Events
     const onMouseMove = (e: MouseEvent) => {
       const rect = container.getBoundingClientRect();
       mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -321,42 +325,47 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     };
     window.addEventListener('resize', onResize);
 
-    // Animation loop
+    // Throttle raycasting — only every 3 frames
+    let frameCount = 0;
+
     const animate = () => {
       state.frameId = requestAnimationFrame(animate);
       controls.update();
+      frameCount++;
 
-      // Hover markers
-      raycaster.setFromCamera(mouse, camera);
-      const hits = raycaster.intersectObjects(markers);
-      if (hits.length > 0) {
-        const hit = hits[0].object as THREE.Mesh;
-        if (state.hoveredMarker !== hit) {
-          if (state.hoveredMarker) {
-            (state.hoveredMarker.material as THREE.MeshBasicMaterial).color.setHex(MARKER_COLOR);
-            (state.hoveredMarker.material as THREE.MeshBasicMaterial).opacity = 0.9;
+      // Raycast hover every 3 frames for perf
+      if (frameCount % 3 === 0 && countryMeshes.length > 0) {
+        raycaster.setFromCamera(mouse, camera);
+        const hits = raycaster.intersectObjects(countryMeshes);
+
+        if (hits.length > 0) {
+          const hitData = countryDataMap.get(hits[0].object as THREE.Mesh);
+          if (hitData && hitData !== state.hoveredCountry) {
+            // Reset previous
+            if (state.hoveredCountry) {
+              state.hoveredCountry.meshes.forEach(m => {
+                (m.material as THREE.MeshBasicMaterial).color.copy(state.hoveredCountry!.baseColor);
+                (m.material as THREE.MeshBasicMaterial).opacity = 0.7;
+              });
+            }
+            state.hoveredCountry = hitData;
+            hitData.meshes.forEach(m => {
+              (m.material as THREE.MeshBasicMaterial).color.copy(hitData.hoverColor);
+              (m.material as THREE.MeshBasicMaterial).opacity = 0.9;
+            });
+            setHoveredName(hitData.name);
+            container.style.cursor = 'pointer';
           }
-          state.hoveredMarker = hit;
-          (hit.material as THREE.MeshBasicMaterial).color.setHex(MARKER_HOVER_COLOR);
-          (hit.material as THREE.MeshBasicMaterial).opacity = 1;
-          setHoveredName(markerNames[markers.indexOf(hit)]);
-          container.style.cursor = 'pointer';
-        }
-      } else {
-        if (state.hoveredMarker) {
-          (state.hoveredMarker.material as THREE.MeshBasicMaterial).color.setHex(MARKER_COLOR);
-          (state.hoveredMarker.material as THREE.MeshBasicMaterial).opacity = 0.9;
-          state.hoveredMarker = null;
+        } else if (state.hoveredCountry) {
+          state.hoveredCountry.meshes.forEach(m => {
+            (m.material as THREE.MeshBasicMaterial).color.copy(state.hoveredCountry!.baseColor);
+            (m.material as THREE.MeshBasicMaterial).opacity = 0.7;
+          });
+          state.hoveredCountry = null;
           setHoveredName(null);
           container.style.cursor = 'default';
         }
       }
-
-      // Pulse markers
-      const time = Date.now() * 0.002;
-      markers.forEach((m, i) => {
-        m.scale.setScalar(1 + Math.sin(time + i * 0.5) * 0.12);
-      });
 
       renderer.render(scene, camera);
     };
@@ -371,13 +380,11 @@ export default function GlobeScene({ onCountryClick, isPanelOpen }: GlobeProps) 
     };
   }, []);
 
-  // Auto-rotate
   useEffect(() => {
     const s = sceneRef.current;
     if (s) s.controls.autoRotate = !isPanelOpen;
   }, [isPanelOpen]);
 
-  // Click
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
