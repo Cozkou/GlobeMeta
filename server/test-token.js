@@ -31,7 +31,7 @@ async function test() {
     console.log('\nTrying to create a test playlist...');
     const playlist = await axios.post(
       'https://api.spotify.com/v1/me/playlists',
-      { name: 'Pulse Earth Vibes Test (delete me)', description: 'Test playlist', public: false },
+      { name: 'GlobeMeta Test (delete me)', description: 'Test playlist', public: false },
       { headers: { Authorization: `Bearer ${token}` } }
     );
     console.log('SUCCESS! Playlist created:', playlist.data.external_urls.spotify);

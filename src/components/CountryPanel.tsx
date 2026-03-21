@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { X, Play, Pause, Loader2, Music } from 'lucide-react';
 import { COUNTRY_NAME_TO_CODE, COUNTRY_META, resolveCountryCode } from '@/data/countryData';
 
@@ -181,63 +182,52 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
 
   return (
     <div
-      className={`fixed z-40 flex max-h-[min(72vh,560px)] w-full max-w-[400px] flex-col overflow-hidden rounded-t-2xl border-t border-x border-white/[0.08] shadow-2xl md:max-h-none md:flex-row md:rounded-none md:border-t-0 md:shadow-none bottom-0 right-0 md:top-0 md:bottom-auto md:h-full md:border-x-0 ${
+      onClick={(e) => e.stopPropagation()}
+      className={`fixed z-40 flex max-h-[min(72vh,560px)] w-full max-w-[380px] flex-col overflow-hidden border-l border-white/[0.06] shadow-2xl bottom-0 right-0 md:top-0 md:bottom-auto md:h-full ${
         isClosing ? 'slide-out-right' : 'slide-in-right'
       }`}
+      style={{ background: 'rgba(6,8,20,0.94)', backdropFilter: 'blur(20px)' }}
     >
-      {/* Mobile: top close row — desktop: slim side rail */}
-      <button
-        onClick={onClose}
-        className="group flex h-11 w-full shrink-0 items-center justify-center gap-2 border-b border-white/[0.06] bg-white/[0.03] hover:bg-white/[0.08] transition-colors active:scale-[0.99] md:h-full md:w-8 md:flex-col md:border-b-0 md:border-r"
-        aria-label="Close panel"
-      >
-        <X size={14} className="text-muted-foreground/60 group-hover:text-foreground transition-colors" />
-        <span className="retro-title text-[10px] text-muted-foreground md:hidden">Close</span>
-      </button>
+      {/* Energy bar at top */}
+      {data && (
+        <div className="h-0.5 w-full shrink-0 overflow-hidden" style={{ background: 'rgba(255,255,255,0.03)' }}>
+          <div
+            className="h-full transition-all duration-1000 ease-out"
+            style={{
+              width: `${Math.round(data.energy * 100)}%`,
+              background: `linear-gradient(90deg, ${vibeColor}, ${withAlpha(vibeColor, 0.4)})`,
+            }}
+          />
+        </div>
+      )}
 
-      {/* Panel */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden panel-blur retro-panel md:border-l md:border-border/30">
-        {/* Energy bar at top */}
-        {data && (
-          <div className="h-1 w-full shrink-0 overflow-hidden" style={{ background: 'rgba(255,255,255,0.03)' }}>
-            <div
-              className="h-full transition-all duration-1000 ease-out"
-              style={{
-                width: `${Math.round(data.energy * 100)}%`,
-                background: `linear-gradient(90deg, ${vibeColor}, ${withAlpha(vibeColor, 0.4)})`,
-                boxShadow: `0 0 12px ${withAlpha(vibeColor, 0.6)}`,
-              }}
-            />
-          </div>
-        )}
-
-        <div className="flex flex-1 flex-col gap-6 overflow-y-auto p-6 pt-6 md:pt-12">
-          {/* Header */}
-          <div>
-            <div className="flex items-start justify-between mb-3">
-              <div className="flex items-center gap-3">
-                <span className="text-4xl">{flag}</span>
-                <h2 className="retro-title text-lg font-bold text-foreground tracking-tight">{displayName}</h2>
-              </div>
-              <button
-                onClick={onClose}
-                aria-label="Close panel"
-                className="w-7 h-7 flex items-center justify-center rounded-sm bg-white/[0.06] hover:bg-white/[0.12] transition-colors border border-white/15"
-              >
-                <X size={12} className="text-muted-foreground" />
-              </button>
+      <div className="flex flex-1 flex-col gap-5 overflow-y-auto p-5 pt-5">
+        {/* Header */}
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2.5">
+              <span className="text-2xl">{flag}</span>
+              <h2 className="retro-title text-base text-foreground tracking-tight">{displayName}</h2>
             </div>
-            <span
-              className="retro-title inline-flex items-center rounded-sm px-3 py-1 text-[10px] font-semibold"
-              style={{
-                backgroundColor: withAlpha(vibeColor, 0.13),
-                color: vibeColor,
-                border: `1px solid ${withAlpha(vibeColor, 0.25)}`,
-              }}
+            <button
+              onClick={onClose}
+              aria-label="Close panel"
+              className="w-7 h-7 flex items-center justify-center rounded-sm bg-white/[0.05] hover:bg-white/[0.12] transition-colors"
             >
-              {vibe}
-            </span>
+              <X size={13} className="text-muted-foreground" />
+            </button>
           </div>
+          <span
+            className="retro-title inline-flex items-center rounded-sm px-2.5 py-0.5 text-[9px]"
+            style={{
+              backgroundColor: withAlpha(vibeColor, 0.1),
+              color: vibeColor,
+              border: `1px solid ${withAlpha(vibeColor, 0.2)}`,
+            }}
+          >
+            {vibe}
+          </span>
+        </div>
 
           {/* Loading state */}
           {loading && (
@@ -343,11 +333,10 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
               </div>
             </>
           )}
-        </div>
 
         {/* Action buttons */}
         {data && !loading && (
-          <div className="p-6 pt-0 flex flex-col gap-2">
+          <div className="p-5 pt-0 flex flex-col gap-2">
             <button
               onClick={handleCreatePlaylist}
               disabled={creatingPlaylist}
@@ -358,7 +347,7 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
                 border: '1px solid hsla(var(--spotify-green) / 0.2)',
               }}
             >
-              {creatingPlaylist ? <Loader2 size={14} className="animate-spin" /> : '🎵'}
+              {creatingPlaylist ? <Loader2 size={14} className="animate-spin" /> : <Music size={14} />}
               {creatingPlaylist ? 'Creating…' : 'Create Playlist'}
             </button>
 
@@ -369,7 +358,7 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
                 ) : (
                   <>
                     <p className="retro-title text-[10px] text-foreground">
-                      🎵 {playlistResult.name}
+                      {playlistResult.name}
                     </p>
                     {playlistResult.tracks.length > 0 && (
                       <div className="flex flex-col gap-0.5">
@@ -389,8 +378,14 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
                         border: '1px solid hsla(var(--spotify-green) / 0.2)',
                       }}
                     >
-                      🎧 Open in Spotify
+                      Open in Spotify
                     </a>
+                    <Link
+                      to="/archive"
+                      className="retro-body block text-center text-[10px] text-cyan-400/75 hover:text-cyan-300 hover:underline"
+                    >
+                      View in Archive
+                    </Link>
                   </>
                 )}
               </div>

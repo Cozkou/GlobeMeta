@@ -56,6 +56,22 @@ const Index = () => {
 
   return (
     <div className="relative w-full h-full pointer-events-none">
+      {/* Page header */}
+      <div className="absolute top-5 left-1/2 -translate-x-1/2 z-30 text-center">
+        <h1
+          className="retro-title text-lg tracking-widest"
+          style={{ color: 'rgba(160,196,240,0.85)', textShadow: '0 2px 12px rgba(0,0,0,0.6)' }}
+        >
+          Globe Mixer
+        </h1>
+        <p
+          className="retro-body text-[11px] mt-1 max-w-[340px]"
+          style={{ color: 'rgba(160,196,240,0.45)' }}
+        >
+          Spin the globe, click any country, and explore its trending tracks.
+        </p>
+      </div>
+
       <div className="absolute top-4 right-4 z-40 w-[min(88vw,320px)] pointer-events-auto">
         {!searchOpen ? (
           <button

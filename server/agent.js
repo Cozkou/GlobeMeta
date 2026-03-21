@@ -8,7 +8,7 @@ async function parseUserIntent(message) {
     max_tokens: 1000,
     messages: [{
       role: 'user',
-      content: `Extract the intent from this message sent to a music bot (Pulse Earth Vibes). The backend has Spotify top tracks per country — use get_trending when the user wants charts, trending, hot tracks, or "top tracks" for a country.
+      content: `Extract the intent from this message sent to GlobeMeta, a chill music bot. The backend has Spotify top tracks per country; use get_trending when the user wants charts, trending, hot tracks, or "top tracks" for a country.
       Return ONLY valid JSON with no extra text.
 
       Examples:
@@ -23,9 +23,16 @@ async function parseUserIntent(message) {
 
       Message: "${message}"
 
+      Message: "I'm feeling happy, play me something"
+      {"intent":"crystal_mood","country":null,"countryCode":null,"mood":"happy"}
+      Message: "I'm sad, what should I listen to?"
+      {"intent":"crystal_mood","country":null,"countryCode":null,"mood":"sad"}
+      Message: "play me something energetic"
+      {"intent":"crystal_mood","country":null,"countryCode":null,"mood":"energetic"}
+
       Return format:
       {
-        "intent": "create_playlist" | "get_trending" | "get_vibe" | "unknown",
+        "intent": "create_playlist" | "get_trending" | "get_vibe" | "crystal_mood" | "unknown",
         "country": "country name or null",
         "countryCode": "2-letter ISO code or null",
         "mood": "any mood mentioned or null"
@@ -56,7 +63,7 @@ async function generatePlaylistDetails(country, tracks) {
       {
         "name": "creative playlist name (max 50 chars)",
         "description": "engaging description (max 100 chars)",
-        "message": "short exciting message to send to user (max 150 chars, include flag emoji, no markdown)"
+        "message": "short warm message for GlobeMeta on Luffa (max 150 chars, relaxed tone like texting a friend, flag emoji ok, no markdown, no em dashes; you may sign off as GlobeMeta)"
       }`
     }]
   });
@@ -68,7 +75,7 @@ async function generatePlaylistDetails(country, tracks) {
     return {
       name: `${country} Vibes`,
       description: `Trending music from ${country}`,
-      message: `Here's what ${country} is listening to right now 🎵`
+      message: `Here's what ${country} is into right now 🎵`
     };
   }
 }
@@ -79,12 +86,12 @@ async function generatePlaylistDetails(country, tracks) {
  */
 async function generateReply(userMessage, context = {}) {
   const { countryData, countryCode } = context;
-  let contextBlock = 'You are Pulse Earth Vibes, a friendly music bot. You help people discover trending music from around the world via Spotify. You can create playlists, list trending tracks, and describe the vibe (energy, danceability, valence) for any country. Do NOT say you lack access to Spotify, charts, or "real-time" data — if the user names a country, the app can fetch that country\'s trending tracks; encourage clear country + "trending" or "top tracks" phrasing instead of refusing.';
+  let contextBlock = 'You are GlobeMeta, a relaxed, friendly music bot (think low-key group chat, not corporate). You help people discover trending music from around the world via Spotify: playlists, top tracks, vibe stats. Never claim you lack Spotify or real data. If the user names a country, the app can load that country\'s tracks; nudge them toward clear asks like trending or top tracks. Never use em dashes (the long dash character) in your replies.';
   if (countryData) {
-    const tracks = countryData.tracks.slice(0, 5).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
+    const tracks = countryData.tracks.slice(0, 5).map((t, i) => `${i + 1}. ${t.name} · ${t.artist}`).join('\n');
     contextBlock += `\n\nCurrent context: User asked about ${countryData.country}. Top tracks: ${tracks}. Energy ${Math.round(countryData.energy * 100)}%, Danceability ${Math.round(countryData.danceability * 100)}%, Valence ${Math.round(countryData.valence * 100)}%.`;
   } else {
-    contextBlock += '\n\nNo specific country was mentioned. If the user asks about music, suggest they try a country (e.g. "What\'s trending in Japan?" or "Make me a playlist from Brazil"). Keep replies concise and friendly.';
+    contextBlock += '\n\nNo specific country was mentioned. If they are asking about music, gently suggest naming a country or trying the globe. Keep it short and chill.';
   }
 
   const response = await client.messages.create({
@@ -92,14 +99,14 @@ async function generateReply(userMessage, context = {}) {
     max_tokens: 500,
     messages: [{
       role: 'user',
-      content: `${contextBlock}\n\nUser message: "${userMessage}"\n\nReply as the bot. Be helpful, concise, and on-topic. Use emojis sparingly. Do not use markdown (no asterisks, underscores, or backticks).`
+      content: `${contextBlock}\n\nUser message: "${userMessage}"\n\nReply as GlobeMeta. Helpful, short, on-topic, chill tone. Emojis sparingly. No markdown (no asterisks, underscores, backticks). No em dashes.`
     }]
   });
 
   try {
     return response.content[0].text.trim();
   } catch {
-    return "I'm Pulse Earth Vibes — I help you discover trending music from around the world! Try asking: \"What's trending in Japan?\" or \"Make me a playlist from Brazil\" 🎵";
+    return "I'm GlobeMeta. I help you find what's trending around the world. Try \"what's trending in Japan?\" or \"playlist from Brazil\" if you want 🎵";
   }
 }
 
@@ -163,7 +170,7 @@ Return ONLY the search query, nothing else. Examples: "upbeat pop official audio
 
 async function generateCrystalSessionPlaylistDetails(tracks) {
   if (!tracks || tracks.length === 0) {
-    return { name: 'My Crystal Ball Session', description: 'Songs from your face-detection session' };
+    return { name: 'GlobeMeta Crystal Ball', description: 'Songs from your GlobeMeta face-detection session' };
   }
   const trackList = tracks.map((t) => `${t.name} by ${t.artist}`).join(', ');
   const response = await client.messages.create({
@@ -171,7 +178,7 @@ async function generateCrystalSessionPlaylistDetails(tracks) {
     max_tokens: 300,
     messages: [{
       role: 'user',
-      content: `Create a Spotify playlist name and description for a Crystal Ball session. These songs were picked based on the user's facial expressions (happiness) during the session.
+      content: `Create a Spotify playlist name and description for a GlobeMeta Crystal Ball session. These songs were picked based on the user's facial expressions (happiness) during the session.
 Tracks: ${trackList}
 
 Return ONLY valid JSON:
@@ -185,12 +192,58 @@ Return ONLY valid JSON:
     const text = response.content[0].text.trim();
     const parsed = JSON.parse(text);
     return {
-      name: (parsed.name || 'My Crystal Ball Session').slice(0, 50),
-      description: (parsed.description || 'Songs from your face-detection session').slice(0, 120),
+      name: (parsed.name || 'GlobeMeta Crystal Ball').slice(0, 50),
+      description: (parsed.description || 'Songs from your GlobeMeta face-detection session').slice(0, 120),
     };
   } catch {
-    return { name: 'My Crystal Ball Session', description: 'Songs from your face-detection session' };
+    return { name: 'GlobeMeta Crystal Ball', description: 'Songs from your GlobeMeta face-detection session' };
   }
 }
 
-module.exports = { parseUserIntent, generatePlaylistDetails, generateReply, analyzeVibe, generateYouTubeSearchQuery, generateCrystalSessionPlaylistDetails };
+async function generateMoodSongReply(mood, tracks) {
+  if (!tracks || tracks.length === 0) {
+    return `Couldn't line up a track for that mood yet. Try wording it another way?`;
+  }
+  const top = tracks[0];
+  const trackList = tracks.slice(0, 3).map((t, i) => `${i + 1}. ${t.name} · ${t.artist}`).join('\n');
+
+  if (!process.env.CLAUDE_API_KEY) {
+    return `For your "${mood}" mood:\n\n${trackList}\n\n${top.spotify_url ? top.spotify_url : ''}`;
+  }
+
+  try {
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 200,
+      messages: [{
+        role: 'user',
+        content: `The user said they feel "${mood}". Matched tracks (GlobeMeta Crystal Ball on Luffa):\n${trackList}\n\nWrite 1-2 short sentences as GlobeMeta, chill and warm, recommending the top pick. No markdown. One emoji max is fine. No em dashes. End with "Listen here:" then newline.`,
+      }],
+    });
+    const reply = response.content[0].text.trim();
+    return `${reply}\n${top.spotify_url || ''}\n\n${trackList}`;
+  } catch {
+    return `For your "${mood}" mood:\n\n${trackList}\n\n${top.spotify_url ? top.spotify_url : ''}`;
+  }
+}
+
+async function generateDigestMessage(countrySummaries) {
+  if (!process.env.CLAUDE_API_KEY) {
+    return `Morning from GlobeMeta. Loose read on what different corners of the world are into:\n\n${countrySummaries}`;
+  }
+  try {
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 300,
+      messages: [{
+        role: 'user',
+        content: `Write a short, easy morning music digest from GlobeMeta. Chill, friendly, like a friend texting. No markdown. Light emoji ok. Do not use em dashes. Data:\n\n${countrySummaries}\n\nUnder 200 words. Greet casually and mention GlobeMeta once at the end.`,
+      }],
+    });
+    return response.content[0].text.trim();
+  } catch {
+    return `Morning from GlobeMeta. Loose read on what different corners of the world are into:\n\n${countrySummaries}`;
+  }
+}
+
+module.exports = { parseUserIntent, generatePlaylistDetails, generateReply, analyzeVibe, generateYouTubeSearchQuery, generateCrystalSessionPlaylistDetails, generateMoodSongReply, generateDigestMessage };

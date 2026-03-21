@@ -25,7 +25,7 @@ app.get('/', (req, res) => {
     `&scope=${encodeURIComponent(SCOPES)}`;
 
   res.send(
-    `<h2>Pulse Earth Vibes — Spotify Auth</h2>` +
+    `<h2>GlobeMeta — Spotify Auth</h2>` +
     `<p>1. <a href="${authUrl}" target="_blank">Click here to authorize Spotify</a></p>` +
     `<p>2. After authorizing, you'll be redirected to a URL like:<br><code>https://globe-meta.vercel.app/callback?code=XXXXXX</code></p>` +
     `<p>3. Copy the <code>code</code> value from the URL and paste it below:</p>` +

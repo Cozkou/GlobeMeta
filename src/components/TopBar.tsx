@@ -7,7 +7,7 @@ const TopBar = () => {
 
       <div className="absolute left-1/2 -translate-x-1/2">
         <h1 className="retro-title text-sm md:text-base font-semibold text-foreground glow-text">
-          Pulse Earth Vibes
+          GlobeMeta
         </h1>
       </div>
 

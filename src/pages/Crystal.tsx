@@ -1,4 +1,5 @@
 import { useRef, useEffect, useState, useCallback, useMemo, type CSSProperties } from 'react';
+import { Link } from 'react-router-dom';
 import * as faceapi from '@vladmandic/face-api';
 import { Loader2, Music, Archive } from 'lucide-react';
 
@@ -35,7 +36,7 @@ function CircularWaveCanvas({ playing }: { playing: boolean }) {
       const { width, height } = canvas;
       const cx = width / 2;
       const cy = height / 2;
-      const ballRadius = Math.min(cx, cy) * 0.28;
+      const ballRadius = Math.min(cx, cy) * 0.36;
       const maxBarLen = ballRadius * 0.35;
 
       ctx.clearRect(0, 0, width, height);
@@ -145,11 +146,11 @@ function CircularWaveCanvas({ playing }: { playing: boolean }) {
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 /** Min time between auto–music changes from mood shifts */
-const HAPPINESS_DEBOUNCE_MS = 14_000;
+const HAPPINESS_DEBOUNCE_MS = 10_000;
 /** Smoothed happiness must move this much (0–1) before a new track fetch */
-const HAPPINESS_MUSIC_JUMP_THRESHOLD = 0.24;
+const HAPPINESS_MUSIC_JUMP_THRESHOLD = 0.18;
 /** ~seconds to settle toward the live face reading (higher = calmer bar) */
-const HAPPINESS_SMOOTH_TIME_CONSTANT_S = 4;
+const HAPPINESS_SMOOTH_TIME_CONSTANT_S = 2.5;
 const MAX_HAPPINESS_DT_S = 0.12;
 const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
 
@@ -165,8 +166,22 @@ type CrystalSpotifyMatch = {
 function happinessFromExpressions(expressions: Record<string, number>): number {
   if (!expressions) return 0.5;
   const happy = expressions.happy ?? 0;
+  const surprised = expressions.surprised ?? 0;
   const sad = expressions.sad ?? 0;
-  return Math.max(0, Math.min(1, happy - sad * 0.5 + 0.5));
+  const angry = expressions.angry ?? 0;
+  const fearful = expressions.fearful ?? 0;
+  const disgusted = expressions.disgusted ?? 0;
+  const positive = happy + surprised * 0.4;
+  const negative = sad + angry * 0.7 + fearful * 0.5 + disgusted * 0.4;
+  return Math.max(0, Math.min(1, 0.5 + positive * 0.5 - negative * 0.5));
+}
+
+function moodLabel(h: number): { text: string; emoji: string } {
+  if (h >= 0.75) return { text: 'Happy', emoji: '😊' };
+  if (h >= 0.6) return { text: 'Upbeat', emoji: '🙂' };
+  if (h <= 0.25) return { text: 'Down', emoji: '😢' };
+  if (h <= 0.4) return { text: 'Mellow', emoji: '😔' };
+  return { text: 'Neutral', emoji: '😐' };
 }
 
 function isSmiling(expressions: Record<string, number>): boolean {
@@ -863,6 +878,10 @@ const Crystal = () => {
               title: v.title,
               channelTitle: v.channelTitle ?? '',
             })),
+            spotifyMatches: spotifyMatches ?? undefined,
+            playlist: playlistResult?.url
+              ? { url: playlistResult.url, name: playlistResult.name ?? null }
+              : null,
           }),
         });
         const json = await res.json().catch(() => ({}));
@@ -882,7 +901,23 @@ const Crystal = () => {
   const isPlaying = !!currentItem;
 
   return (
-    <div className="absolute inset-0 w-full h-full">
+    <div className="absolute inset-0 w-full h-full pointer-events-none">
+      {/* Page header */}
+      <div className="absolute top-5 left-1/2 -translate-x-1/2 z-30 text-center">
+        <h1
+          className="retro-title text-lg tracking-widest"
+          style={{ color: 'rgba(160,196,240,0.85)', textShadow: '0 2px 12px rgba(0,0,0,0.6)' }}
+        >
+          Crystal Ball
+        </h1>
+        <p
+          className="retro-body text-[11px] mt-1 max-w-[340px]"
+          style={{ color: 'rgba(160,196,240,0.45)' }}
+        >
+          Your webcam reads your mood and plays music to match how you feel.
+        </p>
+      </div>
+
       {/* Hidden YouTube player — audio only, no visible embed */}
       <div className="fixed -left-[9999px] top-0 w-px h-px overflow-hidden" aria-hidden>
         <CrystalYouTubeDualStage
@@ -899,14 +934,14 @@ const Crystal = () => {
       </div>
 
       {/* Webcam — IS the crystal ball. Sized to exactly cover the 3D globe. */}
-      <div className="absolute inset-0 z-15 flex items-center justify-center pointer-events-none">
+      <div className="absolute inset-0 z-15 flex items-center justify-center pointer-events-none" style={{ marginTop: '-3vh' }}>
         <div
           className={`relative rounded-full overflow-hidden transition-opacity duration-700 ${
             cameraOn ? 'opacity-95' : 'opacity-0'
           }`}
           style={{
-            width: '28vh',
-            height: '28vh',
+            width: '36vh',
+            height: '36vh',
             boxShadow: '0 0 60px rgba(0,180,255,0.18), inset 0 0 40px rgba(0,0,0,0.6)',
             border: '1.5px solid rgba(100,180,255,0.25)',
           }}
@@ -927,7 +962,7 @@ const Crystal = () => {
       </div>
 
       {/* Centered crystal ball HUD — below the ball */}
-      <div className="absolute inset-0 z-20 flex flex-col items-center justify-end pb-[12vh] pointer-events-none">
+      <div className="absolute inset-0 z-20 flex flex-col items-center justify-end pb-[16vh] pointer-events-none">
         <div
           className="pointer-events-auto flex flex-col items-center gap-2.5 w-[min(80vw,240px)] p-4"
           style={{
@@ -941,35 +976,38 @@ const Crystal = () => {
             </p>
           )}
 
-          {/* Happiness bar */}
-          {sessionActive && (
-            <div className="w-full space-y-1">
-              <div className="flex items-center justify-between">
-                <span className="retro-title text-[8px] text-white/40">Mood</span>
-                <span
-                  className="retro-title text-[8px] tabular-nums"
-                  style={{ color: happiness > 0.6 ? '#4ade80' : happiness < 0.4 ? '#f87171' : '#94a3b8' }}
-                >
-                  {Math.round(happiness * 100)}%
-                </span>
+          {/* Mood indicator */}
+          {sessionActive && (() => {
+            const mood = moodLabel(happiness);
+            const color = happiness > 0.6 ? '#4ade80' : happiness < 0.4 ? '#f87171' : '#94a3b8';
+            return (
+              <div className="w-full space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="retro-title text-[10px]" style={{ color }}>
+                    {mood.emoji} {mood.text}
+                  </span>
+                  <span className="retro-title text-[8px] tabular-nums" style={{ color }}>
+                    {Math.round(happiness * 100)}%
+                  </span>
+                </div>
+                <div className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+                  <div
+                    className="h-full rounded-full"
+                    style={{
+                      width: `${happiness * 100}%`,
+                      transition: 'width 1.5s ease-out, background 1.5s ease-out',
+                      background:
+                        happiness > 0.6
+                          ? 'linear-gradient(90deg,#22c55e,#4ade80)'
+                          : happiness < 0.4
+                            ? 'linear-gradient(90deg,#dc2626,#f87171)'
+                            : 'linear-gradient(90deg,#64748b,#94a3b8)',
+                    }}
+                  />
+                </div>
               </div>
-              <div className="h-1 w-full rounded-full bg-white/10 overflow-hidden">
-                <div
-                  className="h-full rounded-full"
-                  style={{
-                    width: `${happiness * 100}%`,
-                    transition: 'width 2.8s ease-out, background 2.8s ease-out',
-                    background:
-                      happiness > 0.6
-                        ? 'linear-gradient(90deg,#22c55e,#4ade80)'
-                        : happiness < 0.4
-                          ? 'linear-gradient(90deg,#dc2626,#f87171)'
-                          : 'linear-gradient(90deg,#64748b,#94a3b8)',
-                  }}
-                />
-              </div>
-            </div>
-          )}
+            );
+          })()}
 
           {error && <p className="retro-body text-[10px] text-red-400 text-center">{error}</p>}
 
@@ -1011,7 +1049,7 @@ const Crystal = () => {
       {/* End session modal */}
       {showEndModal && (
         <div
-          className="fixed inset-0 z-[60] flex items-center justify-center p-6"
+          className="pointer-events-auto fixed inset-0 z-[60] flex items-center justify-center p-6"
           style={{ background: 'rgba(0,0,0,0.85)' }}
         >
           <div
@@ -1029,9 +1067,17 @@ const Crystal = () => {
               </div>
             )}
             {archiveFilename && (
-              <p className="retro-body text-xs text-green-400/90 mb-3">
-                Archived as <span className="font-mono text-[10px]">{archiveFilename}</span>
-              </p>
+              <div className="mb-3 space-y-2">
+                <p className="retro-body text-xs text-green-400/90">
+                  Archived as <span className="font-mono text-[10px]">{archiveFilename}</span>
+                </p>
+                <Link
+                  to="/archive"
+                  className="retro-body inline-block text-[11px] text-cyan-400/80 hover:text-cyan-300 hover:underline"
+                >
+                  View in Archive
+                </Link>
+              </div>
             )}
             {archiveError && (
               <p className="retro-body text-xs text-red-400 mb-3">{archiveError}</p>
@@ -1039,7 +1085,7 @@ const Crystal = () => {
 
             <p className="retro-body text-xs text-muted-foreground mb-4">
               {sessionItems.length > 0
-                ? `${sessionItems.length} video${sessionItems.length === 1 ? '' : 's'} — matching Spotify tracks…`
+                ? `${sessionItems.length} video${sessionItems.length === 1 ? '' : 's'} · matching Spotify tracks…`
                 : 'No videos played.'}
             </p>
 

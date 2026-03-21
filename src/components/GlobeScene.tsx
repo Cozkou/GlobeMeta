@@ -116,7 +116,7 @@ interface GlobeProps {
   crystalBallMode?: boolean;
 }
 
-const CAM_DEFAULT = new THREE.Vector3(0, 0, 3.2);
+const CAM_DEFAULT = new THREE.Vector3(0, 0.25, 3.2);
 const CAM_CRYSTAL = new THREE.Vector3(0, 0.6, 4.2);
 
 function createStand(): THREE.Group {
@@ -178,23 +178,6 @@ function createStand(): THREE.Group {
   return group;
 }
 
-function createCrystalShell(): THREE.Mesh {
-  const mat = new THREE.MeshPhysicalMaterial({
-    color: 0xaaccff,
-    metalness: 0.0,
-    roughness: 0.05,
-    transmission: 0.92,
-    thickness: 0.3,
-    transparent: true,
-    opacity: 0,
-    side: THREE.FrontSide,
-    envMapIntensity: 0.4,
-  });
-  const mesh = new THREE.Mesh(new THREE.SphereGeometry(1.06, 64, 64), mat);
-  mesh.visible = false;
-  return mesh;
-}
-
 const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPanelOpen, crystalBallMode = false }, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<{
@@ -204,7 +187,7 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
     controls: OrbitControls;
     globe: THREE.Mesh;
     stand: THREE.Group;
-    crystalShell: THREE.Mesh;
+    countryGroup: THREE.Group;
     countryMeshes: THREE.Mesh[];
     countryDataMap: Map<THREE.Mesh, CountryMeshData>;
     raycaster: THREE.Raycaster;
@@ -244,7 +227,11 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
       s.raycaster.setFromCamera(s.mouse, s.camera);
       const hits = s.raycaster.intersectObjects(s.countryMeshes);
       if (hits.length > 0) {
-        const data = s.countryDataMap.get(hits[0].object as THREE.Mesh);
+        const hit = hits[0];
+        const surfaceNormal = hit.point.clone().normalize();
+        const camDir = s.camera.position.clone().normalize();
+        if (surfaceNormal.dot(camDir) < 0.05) return;
+        const data = s.countryDataMap.get(hit.object as THREE.Mesh);
         if (data) onCountryClick(data.name);
       }
     },
@@ -264,7 +251,7 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
-    camera.position.set(0, 0, 3.2);
+    camera.position.set(0, 0.25, 3.2);
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
@@ -289,21 +276,19 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
         emissive: 0x020208,
         shininess: 5,
         specular: 0x111122,
-        transparent: true,
-        opacity: 1,
       })
     );
     scene.add(globe);
 
-    // Atmosphere glow — subtle holographic tint
+    // Atmosphere glow — subtle rim
     const atmosMat = new THREE.ShaderMaterial({
       vertexShader: `varying vec3 vN; varying vec3 vPos; void main(){vN=normalize(normalMatrix*normal);vPos=(modelViewMatrix*vec4(position,1.0)).xyz;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
-      fragmentShader: `varying vec3 vN; varying vec3 vPos; void main(){float rim=1.0-abs(dot(vN,vec3(0,0,1)));float i=pow(rim,4.0)*0.6;vec3 col=mix(vec3(0.15,0.25,0.5),vec3(0.2,0.5,0.8),rim);gl_FragColor=vec4(col,i);}`,
+      fragmentShader: `varying vec3 vN; varying vec3 vPos; void main(){float rim=1.0-abs(dot(vN,vec3(0,0,1)));float i=pow(rim,5.0)*0.25;vec3 col=mix(vec3(0.1,0.18,0.35),vec3(0.15,0.35,0.6),rim);gl_FragColor=vec4(col,i);}`,
       blending: THREE.AdditiveBlending,
       side: THREE.BackSide,
       transparent: true,
     });
-    scene.add(new THREE.Mesh(new THREE.SphereGeometry(1.08, 48, 48), atmosMat));
+    scene.add(new THREE.Mesh(new THREE.SphereGeometry(1.06, 48, 48), atmosMat));
 
     // Stars — lots of them
     const STAR_COUNT = 8000;
@@ -341,9 +326,6 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
     const stand = createStand();
     scene.add(stand);
 
-    const crystalShell = createCrystalShell();
-    scene.add(crystalShell);
-
     const countryGroup = new THREE.Group();
     scene.add(countryGroup);
 
@@ -354,7 +336,7 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
     const mouse = new THREE.Vector2();
 
     const state = {
-      renderer, scene, camera, controls, globe, stand, crystalShell, countryGroup, countryMeshes, countryDataMap,
+      renderer, scene, camera, controls, globe, stand, countryGroup, countryMeshes, countryDataMap,
       raycaster, mouse,
       hoveredCountry: null as CountryMeshData | null,
       frameId: 0,
@@ -512,20 +494,6 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
       const cease = c * c * (3 - 2 * c);
       state.stand.scale.setScalar(cease);
 
-      // Crystal glass shell
-      const shellMat = state.crystalShell.material as THREE.MeshPhysicalMaterial;
-      if (cease > 0.01) {
-        state.crystalShell.visible = true;
-        shellMat.opacity = cease * 0.35;
-      } else {
-        state.crystalShell.visible = false;
-      }
-
-      // Fade the globe surface in crystal mode so the webcam replaces it
-      const surfaceOpacity = 1 - cease * 0.85;
-      (state.globe.material as THREE.MeshPhongMaterial).opacity = surfaceOpacity;
-      state.countryGroup.visible = cease < 0.95;
-
       // Slower auto-rotate when in crystal mode
       controls.autoRotateSpeed = 0.4 - cease * 0.25;
 
@@ -553,8 +521,11 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
         raycaster.setFromCamera(mouse, camera);
         const hits = raycaster.intersectObjects(countryMeshes);
 
-        if (hits.length > 0) {
-          const hitData = countryDataMap.get(hits[0].object as THREE.Mesh);
+        const camDir = camera.position.clone().normalize();
+        const frontHit = hits.find(h => h.point.clone().normalize().dot(camDir) >= 0.05);
+
+        if (frontHit) {
+          const hitData = countryDataMap.get(frontHit.object as THREE.Mesh);
           if (hitData && hitData !== state.hoveredCountry) {
             if (state.hoveredCountry) {
               state.hoveredCountry.meshes.forEach(m => {

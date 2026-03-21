@@ -13,12 +13,12 @@ const {
   iterateCrystalSpotifyMatches,
   getSpotifyCooldownRemaining,
 } = require('./spotify');
-const { parseUserIntent, generatePlaylistDetails, generateReply, analyzeVibe, generateYouTubeSearchQuery, generateCrystalSessionPlaylistDetails } = require('./agent');
+const { parseUserIntent, generatePlaylistDetails, generateReply, analyzeVibe, generateYouTubeSearchQuery, generateCrystalSessionPlaylistDetails, generateMoodSongReply, generateDigestMessage } = require('./agent');
 
 const app = express();
 app.use(express.json());
 
-/** Crystal “End & save” dumps — repo root `archive/` (placeholder until a real archive UI exists). */
+/** Crystal sessions + Globe playlists — repo root `archive/` (JSON files). */
 const CRYSTAL_ARCHIVE_DIR = path.join(__dirname, '..', 'archive');
 
 app.use((req, res, next) => {
@@ -205,7 +205,7 @@ function isKeyError(err) {
 
 async function youtubeSearch(query, key, maxResults = 20) {
   const { data } = await axios.get('https://www.googleapis.com/youtube/v3/search', {
-    params: { part: 'snippet', q: query, type: 'video', maxResults, key },
+    params: { part: 'snippet', q: query, type: 'video', videoCategoryId: '10', maxResults, key },
   });
   return data;
 }
@@ -226,25 +226,108 @@ async function youtubeSearchWithFallback(query) {
   throw lastErr;
 }
 
+/**
+ * Specific artist + song queries per mood bracket so YouTube returns
+ * actual recognisable tracks instead of random instrumentals.
+ */
+const HAPPY_QUERIES = [
+  'Pharrell Williams Happy official video',
+  'Dua Lipa Levitating official video',
+  'Lizzo Good As Hell official video',
+  'Doja Cat Say So official video',
+  'Bruno Mars 24K Magic official video',
+  'Carly Rae Jepsen Call Me Maybe official video',
+  'Miley Cyrus Flowers official video',
+  'Justin Timberlake Can\'t Stop the Feeling official video',
+  'Sabrina Carpenter Espresso official video',
+  'WALK THE MOON Shut Up and Dance official video',
+  'Mark Ronson Uptown Funk ft Bruno Mars official video',
+  'Katy Perry Firework official video',
+  'Beyonce CUFF IT official video',
+  'Shakira Hips Don\'t Lie official video',
+  'Dua Lipa Don\'t Start Now official video',
+];
+
+const SAD_QUERIES = [
+  'Adele Someone Like You official video',
+  'Lewis Capaldi Someone You Loved official video',
+  'Billie Eilish when the party\'s over official video',
+  'Sam Smith Stay With Me official video',
+  'Olivia Rodrigo drivers license official video',
+  'Adele Easy On Me official video',
+  'The Weeknd Call Out My Name official video',
+  'Lana Del Rey Summertime Sadness official video',
+  'SZA Kill Bill official video',
+  'Ed Sheeran Photograph official video',
+  'Juice WRLD Lucid Dreams official video',
+  'Post Malone I Fall Apart official video',
+  'Conan Gray Heather official video',
+  'Taylor Swift All Too Well official video',
+  'Giveon Heartbreak Anniversary official video',
+];
+
+const NEUTRAL_QUERIES = [
+  'The Weeknd Blinding Lights official video',
+  'Harry Styles As It Was official video',
+  'Tame Impala The Less I Know The Better official video',
+  'Arctic Monkeys Do I Wanna Know official video',
+  'Frank Ocean Thinkin Bout You official video',
+  'Mac DeMarco Chamber of Reflection official video',
+  'Clairo Sofia official video',
+  'Steve Lacy Bad Habit official video',
+  'Tyler the Creator See You Again official video',
+  'Khalid Young Dumb and Broke official video',
+  'Glass Animals Heat Waves official video',
+  'Cigarettes After Sex Apocalypse official video',
+  'Hozier Take Me To Church official video',
+  'Tate McRae you broke me first official video',
+  'Daniel Caesar Best Part official video',
+];
+
+function isInstrumentalOrLofi(item) {
+  const title = (item.snippet?.title || '').toLowerCase();
+  const channel = (item.snippet?.channelTitle || '').toLowerCase();
+  const desc = (item.snippet?.description || '').toLowerCase().slice(0, 600);
+  const blob = `${title} ${channel} ${desc}`;
+  return /\binstrumental\b|\blofi\b|\blo-fi\b|\blo fi\b|\bpiano\s+version\b|\bstudy\s+music\b|\bsleep\s+music\b|\bmeditation\b|\bambient\b|\bbackground\s+music\b|\bno\s+vocals\b|\bbeat\s+only\b|\binstrumental\s+version\b|\brelaxing\s+piano\b/i.test(blob);
+}
+
 app.post('/api/youtube-by-happiness', async (req, res) => {
   try {
     const keys = [process.env.YOUTUBE_API_KEY, process.env.YOUTUBE_API_KEY_2].filter(Boolean);
     if (keys.length === 0) return res.status(503).json({ error: 'YOUTUBE_API_KEY not set' });
 
     const h = Math.max(0, Math.min(1, parseFloat(req.body.happiness) || 0.5));
-    const queries =
-      h > 0.6
-        ? ['happy pop official audio', 'feel good songs official music video', 'upbeat hits official audio']
-        : h < 0.4
-          ? ['sad ballad official audio', 'calm acoustic official', 'emotional songs official audio']
-          : ['chill pop official audio', 'relaxing music official', 'easy listening official audio'];
-    const query = queries[Math.floor(Math.random() * queries.length)];
+    const pool = h > 0.6 ? HAPPY_QUERIES : h < 0.4 ? SAD_QUERIES : NEUTRAL_QUERIES;
 
-    const data = await youtubeSearchWithFallback(query);
+    // Pick 3 random queries from the pool, search each, merge results
+    const picked = [...pool].sort(() => Math.random() - 0.5).slice(0, 3);
+    const allItems = [];
+    for (const query of picked) {
+      try {
+        const data = await youtubeSearchWithFallback(query);
+        if (data?.items) allItems.push(...data.items);
+      } catch { /* skip failed query */ }
+    }
 
-    const candidates = (data.items || []).filter(isAllowedYoutubeMusicVideo);
-    const lyricItems = candidates.filter(isLyricVideo);
-    const chosen = (lyricItems.length > 0 ? lyricItems : candidates).slice(0, 5);
+    const candidates = allItems
+      .filter(isAllowedYoutubeMusicVideo)
+      .filter(v => !isInstrumentalOrLofi(v));
+
+    // Dedupe by videoId
+    const seen = new Set();
+    const unique = [];
+    for (const v of candidates) {
+      if (!seen.has(v.id.videoId)) {
+        seen.add(v.id.videoId);
+        unique.push(v);
+      }
+    }
+
+    // Prefer lyrics / official videos
+    const lyricItems = unique.filter(isLyricVideo);
+    const chosen = (lyricItems.length >= 3 ? lyricItems : unique).slice(0, 5);
+
     const videos = chosen.map((v) => ({
       videoId: v.id.videoId,
       title: v.snippet?.title || 'Music',
@@ -253,6 +336,7 @@ app.post('/api/youtube-by-happiness', async (req, res) => {
     if (videos.length === 0) {
       return res.status(404).json({ error: 'No video found' });
     }
+    console.log(`[Crystal] happiness=${h.toFixed(2)} → ${videos.map(v => v.title).join(' | ')}`);
     res.json({ videos });
   } catch (err) {
     console.error('YouTube by happiness error:', err.message, err.response?.data);
@@ -391,11 +475,29 @@ app.post('/api/crystal-archive', async (req, res) => {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const filename = `crystal-${stamp}-${id.slice(0, 8)}.json`;
     const filepath = path.join(CRYSTAL_ARCHIVE_DIR, filename);
+    const trimmedMatches = Array.isArray(spotifyMatches)
+      ? spotifyMatches.slice(0, 80).map((m) => ({
+          videoId: String(m?.videoId ?? ''),
+          youtubeTitle: String(m?.youtubeTitle ?? ''),
+          searchQuery: String(m?.searchQuery ?? ''),
+          spotify: m?.spotify
+            ? {
+                id: String(m.spotify.id ?? ''),
+                name: String(m.spotify.name ?? ''),
+                artist: String(m.spotify.artist ?? ''),
+                spotify_url: String(m.spotify.spotify_url ?? ''),
+              }
+            : null,
+        }))
+      : null;
+
     const payload = {
       version: 1,
+      source: 'crystal',
+      id,
       archivedAt: new Date().toISOString(),
       sessionVideos: trimmedVideos,
-      spotifyMatches: Array.isArray(spotifyMatches) ? spotifyMatches : null,
+      spotifyMatches: trimmedMatches,
       playlist:
         playlist && typeof playlist === 'object'
           ? { url: playlist.url ?? null, name: playlist.name ?? null }
@@ -409,6 +511,56 @@ app.post('/api/crystal-archive', async (req, res) => {
   }
 });
 
+app.get('/api/archive', async (_req, res) => {
+  try {
+    await fs.mkdir(CRYSTAL_ARCHIVE_DIR, { recursive: true });
+    const files = (await fs.readdir(CRYSTAL_ARCHIVE_DIR)).filter((f) => f.endsWith('.json'));
+    const entries = [];
+    for (const filename of files) {
+      try {
+        const raw = await fs.readFile(path.join(CRYSTAL_ARCHIVE_DIR, filename), 'utf8');
+        const data = JSON.parse(raw);
+        const inferredSource =
+          data.source ||
+          (filename.startsWith('globe-') ? 'globe' : filename.startsWith('crystal-') ? 'crystal' : 'unknown');
+        const id =
+          typeof data.id === 'string' && data.id.length > 0
+            ? data.id
+            : filename.replace(/\.json$/i, '');
+        const playlist = data.playlist && typeof data.playlist === 'object' ? data.playlist : null;
+        const sessionVideos = Array.isArray(data.sessionVideos) ? data.sessionVideos : [];
+        const spotifyMatches = Array.isArray(data.spotifyMatches) ? data.spotifyMatches : [];
+        const matchedCount = spotifyMatches.filter((m) => m && m.spotify).length;
+
+        const crystalTitle =
+          playlist?.name ||
+          (sessionVideos.length ? `Crystal session (${sessionVideos.length} tracks)` : 'Crystal Ball session');
+        entries.push({
+          id,
+          filename,
+          source: inferredSource,
+          archivedAt: data.archivedAt || null,
+          title: inferredSource === 'globe' ? `${data.countryName || 'Country'} mix` : crystalTitle,
+          playlistUrl: playlist?.url || null,
+          playlistName: playlist?.name || null,
+          countryCode: data.countryCode || null,
+          countryName: data.countryName || null,
+          sessionVideosCount: sessionVideos.length,
+          spotifyMatchesCount: matchedCount,
+          trackPreview: Array.isArray(data.trackPreview) ? data.trackPreview : null,
+        });
+      } catch (e) {
+        console.warn('archive skip', filename, e.message);
+      }
+    }
+    entries.sort((a, b) => new Date(b.archivedAt || 0) - new Date(a.archivedAt || 0));
+    res.json({ entries });
+  } catch (err) {
+    console.error('archive list:', err);
+    res.status(500).json({ error: err.message || 'Archive list failed' });
+  }
+});
+
 app.post('/api/create-session-playlist', async (req, res) => {
   try {
     const { trackIds = [], tracks = [], name } = req.body;
@@ -419,7 +571,7 @@ app.post('/api/create-session-playlist', async (req, res) => {
       return res.status(400).json({ error: 'trackIds or tracks array required' });
     }
     let playlistName = name;
-    let playlistDesc = 'Songs from your Crystal Ball session — generated by Pulse Earth Vibes';
+    let playlistDesc = 'Songs from your Crystal Ball session · GlobeMeta';
     if (trackList.length > 0) {
       try {
         const details = await generateCrystalSessionPlaylistDetails(trackList);
@@ -450,9 +602,50 @@ app.post('/api/create-playlist', async (req, res) => {
     const details = await generatePlaylistDetails(countryData.country, countryData.tracks);
     const trackUris = countryData.tracks.map(t => `spotify:track:${t.id}`);
     const url = await createPlaylist(details.name, details.description, trackUris);
-    const trackList = countryData.tracks.slice(0, 10).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`);
+    const trackList = countryData.tracks.slice(0, 10).map((t, i) => formatLuffaTrackLine(i + 1, t.name, t.artist));
 
-    res.json({ url, name: details.name, description: details.description, tracks: trackList });
+    // Notify Luffa users about the new playlist
+    notifyLuffaPlaylistCreated(countryData.country, details.name, url, trackList)
+      .catch(e => console.warn('Luffa playlist notify failed:', e.message));
+
+    const archiveId = crypto.randomUUID();
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const globeFilename = `globe-${stamp}-${archiveId.slice(0, 8)}.json`;
+    try {
+      await fs.mkdir(CRYSTAL_ARCHIVE_DIR, { recursive: true });
+      await fs.writeFile(
+        path.join(CRYSTAL_ARCHIVE_DIR, globeFilename),
+        JSON.stringify(
+          {
+            version: 1,
+            source: 'globe',
+            id: archiveId,
+            archivedAt: new Date().toISOString(),
+            countryCode: code,
+            countryName: countryData.country,
+            playlist: {
+              url,
+              name: details.name,
+              description: details.description || null,
+            },
+            trackPreview: trackList.slice(0, 10),
+          },
+          null,
+          2,
+        ),
+        'utf8',
+      );
+    } catch (e) {
+      console.warn('globe archive write failed:', e.message);
+    }
+
+    res.json({
+      url,
+      name: details.name,
+      description: details.description,
+      tracks: trackList,
+      archiveId,
+    });
   } catch (err) {
     const detail = err.response?.data || err.message;
     console.error('Create playlist error:', detail);
@@ -461,6 +654,11 @@ app.post('/api/create-playlist', async (req, res) => {
 });
 
 const PUBLIC_APP_URL = (process.env.PUBLIC_APP_URL || 'https://globe-meta.vercel.app').replace(/\/$/, '');
+
+/** One line for Luffa / playlist lists: no em dash (use middle dot). */
+function formatLuffaTrackLine(i, name, artist) {
+  return `${i}. ${name} · ${artist}`;
+}
 
 /**
  * Shared path: parse intent → fetch Spotify top tracks for country → playlist / trending / vibe.
@@ -471,9 +669,9 @@ const PUBLIC_APP_URL = (process.env.PUBLIC_APP_URL || 'https://globe-meta.vercel
 function luffaFallbackReply(messageText) {
   const t = (messageText || '').trim().toLowerCase();
   if (/^(hi|hello|hey|sup|yo)\b|^hii\b/.test(t)) {
-    return `Hi! I'm Pulse Earth Vibes — I help you discover music from around the world. Try "What's trending in Japan?" or open ${PUBLIC_APP_URL}/globe 🌍`;
+    return `Hey, I'm GlobeMeta. I help you find what's popping around the world. Try "what's trending in Japan?" or chill with the globe here: ${PUBLIC_APP_URL}/globe`;
   }
-  return `I'm Pulse Earth Vibes. Ask for trending tracks or a playlist from any country (e.g. Brazil, Japan), or visit ${PUBLIC_APP_URL}/globe`;
+  return `Hey. GlobeMeta here. Ask for trending tracks or a playlist for any country, or open the globe when you want: ${PUBLIC_APP_URL}/globe`;
 }
 
 /** Short pure greetings — answer immediately without Claude (avoids slow parallel bursts). */
@@ -590,29 +788,54 @@ async function processMusicBotMessage(messageText, fallbackCountryCode = null) {
     if (!globeData[code]) await refreshCountryData(code);
     const cd = globeData[code];
     if (!cd) {
-      return { text: `I couldn't find music data for ${intent.country || 'that country'}. Try a different one!` };
+      return { text: `Couldn't pull tracks for ${intent.country || 'that spot'} right now. Want to try another country?` };
     }
 
     if (intent.intent === 'create_playlist') {
       const details = await generatePlaylistDetails(cd.country, cd.tracks);
       const trackUris = cd.tracks.map(t => `spotify:track:${t.id}`);
       const playlistUrl = await createPlaylist(details.name, details.description, trackUris);
-      const trackList = cd.tracks.slice(0, 10).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
+      const trackList = cd.tracks.slice(0, 10).map((t, i) => formatLuffaTrackLine(i + 1, t.name, t.artist)).join('\n');
       return {
-        text: `${details.message}\n\n🎵 ${details.name}\n${playlistUrl}\n\n${trackList}`,
+        text: `GlobeMeta\n${details.message}\n\n${details.name}\n${playlistUrl}\n\n${trackList}`,
       };
     }
 
     if (intent.intent === 'get_trending') {
-      const trackList = cd.tracks.slice(0, 5).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
+      const trackList = cd.tracks.slice(0, 5).map((t, i) => formatLuffaTrackLine(i + 1, t.name, t.artist)).join('\n');
       return {
-        text: `🔥 Trending in ${cd.country}:\n${trackList}\n\nExplore the globe: ${PUBLIC_APP_URL}/globe`,
+        text: `What's hot in ${cd.country} right now:\n${trackList}\n\nMore on the globe: ${PUBLIC_APP_URL}/globe`,
       };
     }
 
     return {
-      text: `The vibe in ${cd.country} right now:\n⚡ Energy ${Math.round(cd.energy * 100)}%\n💃 Danceability ${Math.round(cd.danceability * 100)}%\n😊 Valence ${Math.round(cd.valence * 100)}%\n\n${PUBLIC_APP_URL}/globe`,
+      text: `Mood snapshot for ${cd.country}:\nEnergy ${Math.round(cd.energy * 100)}%\nDanceability ${Math.round(cd.danceability * 100)}%\nValence ${Math.round(cd.valence * 100)}%\n\nPeek the globe: ${PUBLIC_APP_URL}/globe`,
     };
+  }
+
+  // Crystal Ball on Luffa — user texts a mood, bot replies with a matched song
+  if (intent.intent === 'crystal_mood' && intent.mood) {
+    try {
+      const vibe = await analyzeVibe(intent.mood);
+      const tracks = await getTracksByMood(vibe.energy, vibe.valence, vibe.danceability);
+      const reply = await generateMoodSongReply(intent.mood, tracks);
+      return { text: reply };
+    } catch (e) {
+      console.warn('Crystal mood via Luffa failed:', e.message);
+      return { text: `No match for that mood yet. Try describing the vibe a little differently?` };
+    }
+  }
+
+  // Detect mood-like messages even when Claude classifies as "unknown"
+  if (intent.intent === 'unknown' && intent.mood) {
+    try {
+      const vibe = await analyzeVibe(intent.mood);
+      const tracks = await getTracksByMood(vibe.energy, vibe.valence, vibe.danceability);
+      if (tracks.length > 0) {
+        const reply = await generateMoodSongReply(intent.mood, tracks);
+        return { text: reply };
+      }
+    } catch { /* fall through to general reply */ }
   }
 
   let countryData = null;
@@ -668,7 +891,7 @@ async function runLuffaReplyWorker() {
       } catch (err) {
         console.error('Luffa process error:', err.message);
         try {
-          await sendLuffaMessage(uid, 'Something went wrong. Try again in a moment.', isGroup);
+          await sendLuffaMessage(uid, 'Something glitched on my side. Mind trying again in a sec?', isGroup);
         } catch (sendErr) {
           console.error('Luffa: failed to send error reply:', sendErr.message);
         }
@@ -840,6 +1063,21 @@ async function pollLuffa() {
         console.log(
           `[Luffa] ${new Date().toISOString()} inbox ← uid=${uid}${isGroup ? ' group' : ''} | ${preview}`,
         );
+        trackLuffaUid(uid);
+
+        // Check battle vote before full processing
+        const voteReply = handleBattleVote(uid, text);
+        if (voteReply) {
+          sendLuffaMessage(uid, voteReply, isGroup).catch(() => {});
+          continue;
+        }
+
+        const showcaseKind = matchLuffaShowcaseKeyword(text);
+        if (showcaseKind) {
+          void runLuffaShowcaseFeature(showcaseKind, uid, isGroup);
+          continue;
+        }
+
         enqueueLuffaReply(uid, text, isGroup);
       }
     }
@@ -856,6 +1094,257 @@ async function pollLuffa() {
   }
 }
 
+// ─── Luffa: track known UIDs for broadcasts ───────────────────────────────
+const luffaKnownUids = new Set();
+
+function trackLuffaUid(uid) {
+  if (uid) luffaKnownUids.add(uid);
+}
+
+async function broadcastToLuffa(text) {
+  const secret = process.env.LUFFA_BOT_SECRET;
+  if (!secret) return;
+  const groupUid = process.env.LUFFA_BROADCAST_GROUP_UID;
+  if (groupUid) {
+    await sendLuffaMessage(groupUid, text, true);
+  } else {
+    for (const uid of luffaKnownUids) {
+      await sendLuffaMessage(uid, text, false);
+    }
+  }
+}
+
+// ─── Feature: playlist link notification from website ──────────────────────
+async function notifyLuffaPlaylistCreated(countryName, playlistName, playlistUrl, trackList) {
+  const msg = `New playlist just dropped on GlobeMeta.\n\n${playlistName} (${countryName})\n${playlistUrl}\n\n${trackList.slice(0, 5).join('\n')}`;
+  await broadcastToLuffa(msg);
+}
+
+// ─── Feature: Daily Morning Digest (mock data) ────────────────────────────
+const MOCK_DIGEST_DATA = [
+  { country: 'United States', artist: 'Sabrina Carpenter', track: 'Espresso', energy: 82 },
+  { country: 'Japan', artist: 'YOASOBI', track: 'Idol', energy: 91 },
+  { country: 'Brazil', artist: 'Anitta', track: 'Mil Veces', energy: 88 },
+  { country: 'South Korea', artist: 'NewJeans', track: 'Super Shy', energy: 79 },
+  { country: 'Nigeria', artist: 'Burna Boy', track: 'City Boys', energy: 85 },
+  { country: 'United Kingdom', artist: 'Dua Lipa', track: 'Houdini', energy: 77 },
+  { country: 'France', artist: 'Aya Nakamura', track: 'Djadja', energy: 83 },
+  { country: 'India', artist: 'Arijit Singh', track: 'Kesariya', energy: 65 },
+  { country: 'Germany', artist: 'Apache 207', track: 'Komet', energy: 74 },
+  { country: 'Colombia', artist: 'Feid', track: 'Ferxxocalipsis', energy: 86 },
+];
+
+async function sendDailyDigest() {
+  const pick = [...MOCK_DIGEST_DATA].sort(() => Math.random() - 0.5).slice(0, 5);
+  const lines = pick.map(d => `${d.country}: "${d.track}" by ${d.artist} (${d.energy}% energy)`);
+  const summary = lines.join('\n');
+
+  let msg;
+  try {
+    msg = await generateDigestMessage(summary);
+  } catch {
+    msg = `Morning. GlobeMeta here with a loose read on what the world is into:\n\n${summary}\n\nDig in on the globe: ${PUBLIC_APP_URL}/globe`;
+  }
+  console.log('[Luffa] Sending daily morning digest');
+  await broadcastToLuffa(msg);
+}
+
+// ─── Feature: Globe Alert — genre/artist spike notifications (mock) ───────
+const MOCK_ALERTS = [
+  { country: 'South Korea', genre: 'K-Pop', artist: 'NewJeans', track: 'Super Shy', spike: '+340%' },
+  { country: 'Nigeria', genre: 'Afrobeats', artist: 'Burna Boy', track: 'City Boys', spike: '+280%' },
+  { country: 'Brazil', genre: 'Funk', artist: 'MC Livinho', track: 'Bandida', spike: '+190%' },
+  { country: 'Japan', genre: 'J-Pop', artist: 'YOASOBI', track: 'Idol', spike: '+420%' },
+  { country: 'United States', genre: 'Pop', artist: 'Sabrina Carpenter', track: 'Espresso', spike: '+210%' },
+  { country: 'Colombia', genre: 'Reggaeton', artist: 'Feid', track: 'Ferxxocalipsis', spike: '+260%' },
+  { country: 'United Kingdom', genre: 'Pop', artist: 'Dua Lipa', track: 'Houdini', spike: '+175%' },
+  { country: 'India', genre: 'Bollywood', artist: 'Arijit Singh', track: 'Kesariya', spike: '+150%' },
+];
+
+let lastAlertIdx = 0;
+async function sendGlobeAlert() {
+  const alert = MOCK_ALERTS[lastAlertIdx % MOCK_ALERTS.length];
+  lastAlertIdx++;
+  const msg = `Heads up from GlobeMeta.\n\n${alert.genre} is spiking in ${alert.country} (${alert.spike}). People are heavy on "${alert.track}" by ${alert.artist}.\n\nScope it: ${PUBLIC_APP_URL}/globe`;
+  console.log('[Luffa] Sending globe alert:', alert.country, alert.genre);
+  await broadcastToLuffa(msg);
+}
+
+// ─── Feature: Country Battle Poll ─────────────────────────────────────────
+const BATTLE_COUNTRIES = [
+  { name: 'United States', code: 'US', flag: '🇺🇸' },
+  { name: 'Japan', code: 'JP', flag: '🇯🇵' },
+  { name: 'Brazil', code: 'BR', flag: '🇧🇷' },
+  { name: 'South Korea', code: 'KR', flag: '🇰🇷' },
+  { name: 'Nigeria', code: 'NG', flag: '🇳🇬' },
+  { name: 'France', code: 'FR', flag: '🇫🇷' },
+  { name: 'India', code: 'IN', flag: '🇮🇳' },
+  { name: 'United Kingdom', code: 'GB', flag: '🇬🇧' },
+  { name: 'Colombia', code: 'CO', flag: '🇨🇴' },
+  { name: 'Germany', code: 'DE', flag: '🇩🇪' },
+  { name: 'Mexico', code: 'MX', flag: '🇲🇽' },
+  { name: 'Australia', code: 'AU', flag: '🇦🇺' },
+];
+
+let activeBattle = null;
+const battleVotes = { '1': new Set(), '2': new Set() };
+
+function pickTwoCountries() {
+  const shuffled = [...BATTLE_COUNTRIES].sort(() => Math.random() - 0.5);
+  return [shuffled[0], shuffled[1]];
+}
+
+async function startCountryBattle() {
+  const [a, b] = pickTwoCountries();
+  activeBattle = { a, b, startedAt: Date.now() };
+  battleVotes['1'].clear();
+  battleVotes['2'].clear();
+
+  const msg = `Low stakes poll from GlobeMeta.\n\nWhich side are you feeling?\n${a.flag} reply 1 for ${a.name}\n${b.flag} reply 2 for ${b.name}\n\nOpen for about 2 hours, no pressure.`;
+  console.log(`[Luffa] Country battle started: ${a.name} vs ${b.name}`);
+  await broadcastToLuffa(msg);
+
+  // End after 2 hours
+  setTimeout(async () => {
+    if (!activeBattle) return;
+    const v1 = battleVotes['1'].size;
+    const v2 = battleVotes['2'].size;
+    const total = v1 + v2;
+    let result;
+    if (total === 0) {
+      result = `Country battle wrap (GlobeMeta)\n\n${a.flag} ${a.name} vs ${b.flag} ${b.name}\n\nQuiet round, no votes this time. All good.`;
+    } else {
+      const winner = v1 > v2 ? a : v2 > v1 ? b : null;
+      if (winner) {
+        result = `Country battle wrap (GlobeMeta)\n\n${winner.flag} ${winner.name} takes it.\n\n${a.flag} ${a.name}: ${v1} vote${v1 !== 1 ? 's' : ''}\n${b.flag} ${b.name}: ${v2} vote${v2 !== 1 ? 's' : ''}\n\n${total} votes total`;
+      } else {
+        result = `Country battle wrap (GlobeMeta)\n\nDead tie.\n\n${a.flag} ${a.name}: ${v1} vote${v1 !== 1 ? 's' : ''}\n${b.flag} ${b.name}: ${v2} vote${v2 !== 1 ? 's' : ''}\n\n${total} votes total`;
+      }
+    }
+    await broadcastToLuffa(result);
+    activeBattle = null;
+  }, 2 * 60 * 60 * 1000);
+}
+
+function handleBattleVote(uid, text) {
+  if (!activeBattle) return false;
+  const t = text.trim();
+  if (t === '1' || t === '2') {
+    // Remove previous vote if any
+    battleVotes['1'].delete(uid);
+    battleVotes['2'].delete(uid);
+    battleVotes[t].add(uid);
+    const country = t === '1' ? activeBattle.a : activeBattle.b;
+    return `Got it, counting you for ${country.flag} ${country.name}.`;
+  }
+  return false;
+}
+
+/** Type these exact phrases (any case) to trigger a feature immediately for demos. */
+const LUFFA_SHOWCASE_KEYWORDS = {
+  'SHOWCASE-DIGEST': 'digest',
+  'SHOWCASE-ALERT': 'alert',
+  'SHOWCASE-BATTLE': 'battle',
+  'SHOWCASE-PLAYLIST': 'playlist',
+  'SHOWCASE-MOOD': 'mood',
+};
+
+function matchLuffaShowcaseKeyword(raw) {
+  const key = (raw || '').trim().toUpperCase();
+  return LUFFA_SHOWCASE_KEYWORDS[key] || null;
+}
+
+async function runLuffaShowcaseFeature(kind, uid, isGroup) {
+  const secret = process.env.LUFFA_BOT_SECRET;
+  if (!secret) return;
+
+  const toUser = (msg) => sendLuffaMessage(uid, msg, isGroup);
+
+  try {
+    if (kind === 'mood') {
+      await toUser('Quick demo: matching a song for a hyped, party ready mood…');
+      const sampleMood = 'excited and ready to party';
+      const vibe = await analyzeVibe(sampleMood);
+      const tracks = await getTracksByMood(vibe.energy, vibe.valence, vibe.danceability);
+      const reply = await generateMoodSongReply(sampleMood, tracks);
+      await toUser(`Crystal Ball demo pick:\n\n${reply}`);
+      return;
+    }
+
+    await toUser(`Running the ${kind} demo now (goes to your broadcast group or everyone who's DMed the bot)…`);
+
+    switch (kind) {
+      case 'digest':
+        await sendDailyDigest();
+        break;
+      case 'alert':
+        await sendGlobeAlert();
+        break;
+      case 'battle':
+        await startCountryBattle();
+        break;
+      case 'playlist':
+        await notifyLuffaPlaylistCreated(
+          'Japan',
+          'GlobeMeta demo: Tokyo',
+          'https://open.spotify.com/playlist/37i9dQZEVXbMDoHDwVN2tF',
+          [
+            '1. Idol · YOASOBI',
+            '2. 夜に駆ける · YOASOBI',
+            '3. Pretender · Official Hige Dandism',
+            '4. Lemon · Kenshi Yonezu',
+            '5. Tokyo Flash · Vaundy',
+          ],
+        );
+        break;
+      default:
+        break;
+    }
+
+    await toUser(`All set, ${kind} demo is out.`);
+  } catch (e) {
+    await toUser(`Demo hit a snag: ${e.message}`);
+  }
+}
+
+// ─── Luffa scheduled features timer ───────────────────────────────────────
+function startLuffaScheduledFeatures() {
+  const secret = process.env.LUFFA_BOT_SECRET;
+  if (!secret) return;
+
+  // Daily digest — send once at ~9am (check every 15 min, fire once per day)
+  let lastDigestDay = -1;
+  setInterval(() => {
+    const now = new Date();
+    const hour = now.getHours();
+    const day = now.getDate();
+    if (hour === 9 && day !== lastDigestDay) {
+      lastDigestDay = day;
+      sendDailyDigest().catch(e => console.error('Digest error:', e.message));
+    }
+  }, 15 * 60 * 1000);
+
+  // Globe alerts — every 4 hours
+  setInterval(() => {
+    sendGlobeAlert().catch(e => console.error('Globe alert error:', e.message));
+  }, 4 * 60 * 60 * 1000);
+  // First alert after 30 min
+  setTimeout(() => {
+    sendGlobeAlert().catch(e => console.error('Globe alert error:', e.message));
+  }, 30 * 60 * 1000);
+
+  // Country battle — every 6 hours
+  setInterval(() => {
+    startCountryBattle().catch(e => console.error('Battle error:', e.message));
+  }, 6 * 60 * 60 * 1000);
+  // First battle after 5 min
+  setTimeout(() => {
+    startCountryBattle().catch(e => console.error('Battle error:', e.message));
+  }, 5 * 60 * 1000);
+
+  console.log('[Luffa] Scheduled features: daily digest (9am), globe alerts (4h), country battles (6h)');
+}
+
 function startLuffaPoller() {
   const secret = process.env.LUFFA_BOT_SECRET;
   if (!secret) {
@@ -868,6 +1357,9 @@ function startLuffaPoller() {
   console.log(
     `Luffa: polling every ${LUFFA_POLL_INTERVAL_MS}ms — IN/reply lines use ISO timestamps; ~15s idle heartbeat when queue empty.`,
   );
+  console.log(
+    'Luffa showcase keywords (type in chat): SHOWCASE-DIGEST | SHOWCASE-ALERT | SHOWCASE-BATTLE | SHOWCASE-PLAYLIST | SHOWCASE-MOOD',
+  );
   setInterval(pollLuffa, LUFFA_POLL_INTERVAL_MS);
   pollLuffa();
 }
@@ -876,4 +1368,5 @@ const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   startLuffaPoller();
+  startLuffaScheduledFeatures();
 });
