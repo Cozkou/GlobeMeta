@@ -8,7 +8,7 @@ async function parseUserIntent(message) {
     max_tokens: 1000,
     messages: [{
       role: 'user',
-      content: `Extract the intent from this message sent to GlobeMeta, a chill music bot. The backend has Spotify top tracks per country; use get_trending when the user wants charts, trending, hot tracks, or "top tracks" for a country.
+      content: `Extract the intent from this message sent to GlobeMeta, a chill music bot. The backend has YouTube music picks per country (globe); use get_trending when the user wants charts, trending, hot tracks, or "top tracks" for a country.
       Return ONLY valid JSON with no extra text.
 
       Examples:
@@ -56,7 +56,7 @@ async function generatePlaylistDetails(country, tracks) {
     max_tokens: 1000,
     messages: [{
       role: 'user',
-      content: `Create a Spotify playlist name and description for a playlist of trending music from ${country}.
+      content: `Create a YouTube playlist name and description for a playlist of trending music videos from ${country}.
       Tracks include: ${trackList}
       
       Return ONLY valid JSON:
@@ -86,7 +86,7 @@ async function generatePlaylistDetails(country, tracks) {
  */
 async function generateReply(userMessage, context = {}) {
   const { countryData, countryCode } = context;
-  let contextBlock = 'You are GlobeMeta, a relaxed, friendly music bot (think low-key group chat, not corporate). You help people discover trending music from around the world via Spotify: playlists, top tracks, vibe stats. Never claim you lack Spotify or real data. If the user names a country, the app can load that country\'s tracks; nudge them toward clear asks like trending or top tracks. Never use em dashes (the long dash character) in your replies.';
+  let contextBlock = 'You are GlobeMeta, a relaxed, friendly music bot (think low-key group chat, not corporate). You help people discover trending music from around the world via YouTube (globe picks, playlists, vibe stats). Never claim you lack real data. If the user names a country, the app can load that country\'s picks; nudge them toward clear asks like trending or top tracks. Never use em dashes (the long dash character) in your replies.';
   if (countryData) {
     const tracks = countryData.tracks.slice(0, 5).map((t, i) => `${i + 1}. ${t.name} · ${t.artist}`).join('\n');
     contextBlock += `\n\nCurrent context: User asked about ${countryData.country}. Top tracks: ${tracks}. Energy ${Math.round(countryData.energy * 100)}%, Danceability ${Math.round(countryData.danceability * 100)}%, Valence ${Math.round(countryData.valence * 100)}%.`;
@@ -178,7 +178,7 @@ async function generateCrystalSessionPlaylistDetails(tracks) {
     max_tokens: 300,
     messages: [{
       role: 'user',
-      content: `Create a Spotify playlist name and description for a GlobeMeta Crystal Ball session. These songs were picked based on the user's facial expressions (happiness) during the session.
+      content: `Create a YouTube playlist name and description for a GlobeMeta Crystal Ball session. These videos were picked based on the user's facial expressions (happiness) during the session.
 Tracks: ${trackList}
 
 Return ONLY valid JSON:
@@ -207,8 +207,9 @@ async function generateMoodSongReply(mood, tracks) {
   const top = tracks[0];
   const trackList = tracks.slice(0, 3).map((t, i) => `${i + 1}. ${t.name} · ${t.artist}`).join('\n');
 
+  const listen = top.youtube_url || top.spotify_url || '';
   if (!process.env.CLAUDE_API_KEY) {
-    return `For your "${mood}" mood:\n\n${trackList}\n\n${top.spotify_url ? top.spotify_url : ''}`;
+    return `For your "${mood}" mood:\n\n${trackList}\n\n${listen}`;
   }
 
   try {
@@ -221,9 +222,9 @@ async function generateMoodSongReply(mood, tracks) {
       }],
     });
     const reply = response.content[0].text.trim();
-    return `${reply}\n${top.spotify_url || ''}\n\n${trackList}`;
+    return `${reply}\n${listen}\n\n${trackList}`;
   } catch {
-    return `For your "${mood}" mood:\n\n${trackList}\n\n${top.spotify_url ? top.spotify_url : ''}`;
+    return `For your "${mood}" mood:\n\n${trackList}\n\n${listen}`;
   }
 }
 

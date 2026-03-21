@@ -1,6 +1,7 @@
-import { useRef, useEffect, useState, useCallback, useMemo, type CSSProperties } from 'react';
+import { useRef, useEffect, useState, useCallback, type CSSProperties } from 'react';
 import { Link } from 'react-router-dom';
 import * as faceapi from '@vladmandic/face-api';
+import type { Pose } from '@tensorflow-models/pose-detection';
 import { Loader2, Music, Archive } from 'lucide-react';
 
 /** Circular RGB audio-wave visualizer drawn on a <canvas> right at the crystal ball edge. */
@@ -147,6 +148,10 @@ function CircularWaveCanvas({ playing }: { playing: boolean }) {
 const API_BASE = import.meta.env.VITE_API_URL || '';
 /** Min time between auto–music changes from mood shifts */
 const HAPPINESS_DEBOUNCE_MS = 10_000;
+/** Consecutive frames before duo / flex counts as “locked in” (~0.5s at 30fps) */
+const SCENE_STABLE_FRAMES = 15;
+/** Run MoveNet every N face frames to save CPU */
+const POSE_EVERY_N_FRAMES = 3;
 /** Smoothed happiness must move this much (0–1) before a new track fetch */
 const HAPPINESS_MUSIC_JUMP_THRESHOLD = 0.18;
 /** ~seconds to settle toward the live face reading (higher = calmer bar) */
@@ -155,13 +160,6 @@ const MAX_HAPPINESS_DT_S = 0.12;
 const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
 
 type YouTubeVideo = { source: 'youtube'; videoId: string; title: string; channelTitle?: string };
-
-type CrystalSpotifyMatch = {
-  videoId: string;
-  youtubeTitle: string;
-  searchQuery: string;
-  spotify: { id: string; name: string; artist: string; spotify_url: string } | null;
-};
 
 function happinessFromExpressions(expressions: Record<string, number>): number {
   if (!expressions) return 0.5;
@@ -188,6 +186,43 @@ function isSmiling(expressions: Record<string, number>): boolean {
   if (!expressions) return false;
   const happy = expressions.happy ?? 0;
   return happy > 0.5;
+}
+
+function angleAtElbowDeg(
+  s: { x: number; y: number },
+  e: { x: number; y: number },
+  w: { x: number; y: number },
+): number {
+  const v1x = s.x - e.x;
+  const v1y = s.y - e.y;
+  const v2x = w.x - e.x;
+  const v2y = w.y - e.y;
+  const m = Math.hypot(v1x, v1y) * Math.hypot(v2x, v2y);
+  if (m < 1e-6) return 180;
+  const c = Math.max(-1, Math.min(1, (v1x * v2x + v1y * v2y) / m));
+  return (Math.acos(c) * 180) / Math.PI;
+}
+
+/** Double bicep / “flex”: both elbows bent, wrists lifted (MoveNet COCO keypoints). */
+function isDoubleFlexPose(pose: Pose | undefined): boolean {
+  if (!pose?.keypoints || (pose.score ?? 0) < 0.22) return false;
+  const named = (n: string) => pose.keypoints!.find((k) => k.name === n);
+  const minKp = 0.26;
+  const ls = named('left_shoulder');
+  const rs = named('right_shoulder');
+  const le = named('left_elbow');
+  const re = named('right_elbow');
+  const lw = named('left_wrist');
+  const rw = named('right_wrist');
+  for (const p of [ls, rs, le, re, lw, rw]) {
+    if (!p || (p.score ?? 0) < minKp) return false;
+  }
+  const leftAngle = angleAtElbowDeg(ls!, le!, lw!);
+  const rightAngle = angleAtElbowDeg(rs!, re!, rw!);
+  const bent = leftAngle >= 30 && leftAngle <= 135 && rightAngle >= 30 && rightAngle <= 135;
+  if (!bent) return false;
+  const raised = lw!.y < le!.y + 0.14 && rw!.y < re!.y + 0.14;
+  return raised;
 }
 
 const YT_ERROR_CODES = new Set([2, 5, 100, 101, 150]);
@@ -427,6 +462,9 @@ function CrystalYouTubeDualStage({
   );
 }
 
+type CrystalPlaylistMode = 'mood' | 'romantic' | 'gym';
+type CrystalHudScene = CrystalPlaylistMode;
+
 const Crystal = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -434,10 +472,17 @@ const Crystal = () => {
   const smoothedHappinessRef = useRef(0.5);
   const lastHappinessSampleTsRef = useRef(performance.now());
   const lastMusicRef = useRef(0);
+  const playlistModeRef = useRef<CrystalPlaylistMode>('mood');
+  const poseDetectorRef = useRef<{ estimatePoses: (input: HTMLVideoElement, cfg?: { flipHorizontal?: boolean }) => Promise<Pose[]>; dispose: () => void } | null>(null);
+  const poseFrameCounterRef = useRef(0);
+  const flexStreakRef = useRef(0);
+  const duoStreakRef = useRef(0);
   const [youtubeQueue, setYoutubeQueue] = useState<YouTubeVideo[]>([]);
 
   const [cameraOn, setCameraOn] = useState(false);
   const [modelsLoaded, setModelsLoaded] = useState(false);
+  const [poseReady, setPoseReady] = useState(false);
+  const [crystalHudScene, setCrystalHudScene] = useState<CrystalHudScene>('mood');
   const [happiness, setHappiness] = useState(0.5);
   const [currentItem, setCurrentItem] = useState<YouTubeVideo | null>(null);
   const [sessionItems, setSessionItems] = useState<YouTubeVideo[]>([]);
@@ -445,15 +490,6 @@ const Crystal = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const [spotifyMatches, setSpotifyMatches] = useState<CrystalSpotifyMatch[] | null>(null);
-  const [resolveLoading, setResolveLoading] = useState(false);
-  const [resolveError, setResolveError] = useState<string | null>(null);
-  const [resolveProgress, setResolveProgress] = useState<{
-    current: number;
-    total: number;
-    workingOn: string;
-  } | null>(null);
-  const [resolveElapsedSec, setResolveElapsedSec] = useState(0);
   const [playlistLoading, setPlaylistLoading] = useState(false);
   const [playlistResult, setPlaylistResult] = useState<{ url: string; name?: string } | null>(null);
   const [playlistError, setPlaylistError] = useState<string | null>(null);
@@ -461,153 +497,8 @@ const Crystal = () => {
   const [archiveError, setArchiveError] = useState<string | null>(null);
   const [archiveFilename, setArchiveFilename] = useState<string | null>(null);
 
-  const sessionResolveKey = useMemo(
-    () =>
-      sessionEnded && sessionItems.length > 0
-        ? sessionItems.map((v) => `${v.videoId}\t${v.title}`).join('\n')
-        : '',
-    [sessionEnded, sessionItems],
-  );
-
-  useEffect(() => {
-    if (!resolveLoading) {
-      setResolveElapsedSec(0);
-      return;
-    }
-    const t0 = Date.now();
-    const id = window.setInterval(() => {
-      setResolveElapsedSec(Math.floor((Date.now() - t0) / 1000));
-    }, 400);
-    return () => window.clearInterval(id);
-  }, [resolveLoading]);
-
-  useEffect(() => {
-    if (!sessionResolveKey) return;
-    let cancelled = false;
-    const ac = new AbortController();
-    setResolveLoading(true);
-    setResolveError(null);
-    setResolveProgress(null);
-    setSpotifyMatches(null);
-    setPlaylistResult(null);
-    setPlaylistError(null);
-
-    const videosPayload = sessionItems.map((v) => ({
-      videoId: v.videoId,
-      title: v.title,
-      channelTitle: v.channelTitle ?? '',
-    }));
-
-    (async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/crystal-youtube-to-spotify`, {
-          method: 'POST',
-          signal: ac.signal,
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/x-ndjson, application/json;q=0.9',
-          },
-          body: JSON.stringify({ videos: videosPayload }),
-        });
-
-        const ct = res.headers.get('content-type') || '';
-
-        if (!res.ok) {
-          const text = await res.text();
-          let msg = text.slice(0, 200);
-          try {
-            const j = JSON.parse(text) as { error?: string };
-            if (typeof j.error === 'string') msg = j.error;
-          } catch {
-            /* use text */
-          }
-          throw new Error(msg || `Server error (${res.status})`);
-        }
-
-        if (ct.includes('application/json')) {
-          const data = (await res.json()) as { matches?: CrystalSpotifyMatch[] };
-          if (!cancelled) setSpotifyMatches(data.matches || []);
-          return;
-        }
-
-        const reader = res.body?.getReader();
-        if (!reader) throw new Error('No response body from server');
-
-        const decoder = new TextDecoder();
-        let buffer = '';
-        const collected: CrystalSpotifyMatch[] = [];
-
-        while (!cancelled) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            let msg: {
-              type?: string;
-              total?: number;
-              current?: number;
-              workingOn?: string;
-              match?: CrystalSpotifyMatch;
-              error?: string;
-            };
-            try {
-              msg = JSON.parse(line) as typeof msg;
-            } catch {
-              continue;
-            }
-            if (msg.type === 'start' && typeof msg.total === 'number') {
-              if (!cancelled) {
-                setResolveProgress({ current: 0, total: msg.total, workingOn: 'Starting…' });
-              }
-            } else if (msg.type === 'progress' && msg.match) {
-              collected.push(msg.match);
-              if (!cancelled) {
-                setSpotifyMatches([...collected]);
-                setResolveProgress({
-                  current: msg.current ?? collected.length,
-                  total: msg.total ?? collected.length,
-                  workingOn: msg.workingOn || msg.match.youtubeTitle || '',
-                });
-              }
-            } else if (msg.type === 'error') {
-              throw new Error(msg.error || 'Match stream failed');
-            }
-          }
-        }
-
-        if (!cancelled) setResolveProgress(null);
-      } catch (e: unknown) {
-        if (cancelled || (e instanceof DOMException && e.name === 'AbortError')) return;
-        if (!cancelled) setResolveError(e instanceof Error ? e.message : 'Could not match tracks');
-      } finally {
-        if (!cancelled) {
-          setResolveLoading(false);
-          setResolveProgress(null);
-        }
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      ac.abort();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- sessionResolveKey encodes sessionItems
-  }, [sessionResolveKey]);
-
-  const handleCreateSpotifyPlaylist = useCallback(async () => {
-    if (!spotifyMatches) return;
-    const matched = spotifyMatches.filter((m) => m.spotify);
-    const byId = new Map<string, { id: string; name: string; artist: string }>();
-    for (const m of matched) {
-      if (m.spotify && !byId.has(m.spotify.id)) {
-        byId.set(m.spotify.id, { id: m.spotify.id, name: m.spotify.name, artist: m.spotify.artist });
-      }
-    }
-    const tracks = [...byId.values()];
-    if (tracks.length === 0) return;
+  const handleCreateYouTubePlaylist = useCallback(async () => {
+    if (sessionItems.length === 0) return;
     setPlaylistLoading(true);
     setPlaylistError(null);
     try {
@@ -615,28 +506,27 @@ const Crystal = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          trackIds: tracks.map((t) => t.id),
-          tracks,
+          videos: sessionItems.map((v) => ({
+            videoId: v.videoId,
+            title: v.title,
+            channelTitle: v.channelTitle ?? '',
+          })),
         }),
       });
-      const json = await res.json().catch(() => ({}));
+      const json = (await res.json().catch(() => ({}))) as { url?: string; name?: string; error?: string };
       if (!res.ok) throw new Error(typeof json.error === 'string' ? json.error : 'Playlist failed');
-      setPlaylistResult({ url: json.url, name: json.name });
+      setPlaylistResult({ url: json.url || '', name: json.name });
     } catch (e: unknown) {
       setPlaylistError(e instanceof Error ? e.message : 'Playlist failed');
     } finally {
       setPlaylistLoading(false);
     }
-  }, [spotifyMatches]);
+  }, [sessionItems]);
 
   const closeSessionModal = useCallback(() => {
     setSessionItems([]);
     setCurrentItem(null);
     setSessionEnded(false);
-    setSpotifyMatches(null);
-    setResolveError(null);
-    setResolveLoading(false);
-    setResolveProgress(null);
     setPlaylistResult(null);
     setPlaylistError(null);
   }, []);
@@ -661,8 +551,30 @@ const Crystal = () => {
     }
   }, []);
 
+  const fetchYouTubeByScene = useCallback(async (scene: 'romantic' | 'gym'): Promise<YouTubeVideo[]> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/youtube-crystal-scene`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scene }),
+      });
+      if (!res.ok) return [];
+      const { videos } = await res.json();
+      return (videos || []).map((v: { videoId: string; title: string; channelTitle?: string }) => ({
+        source: 'youtube' as const,
+        videoId: v.videoId,
+        title: v.title,
+        channelTitle: v.channelTitle || '',
+      }));
+    } catch {
+      return [];
+    }
+  }, []);
+
   const playMusicForHappiness = useCallback(
     async (h: number) => {
+      playlistModeRef.current = 'mood';
+      setCrystalHudScene('mood');
       setLoading(true);
       setError(null);
       try {
@@ -672,6 +584,7 @@ const Crystal = () => {
           setYoutubeQueue(rest);
           setCurrentItem(first);
           setSessionItems((prev) => [...prev, first]);
+          lastMusicRef.current = Date.now();
         } else {
           setError('No music available. Add YOUTUBE_API_KEY to server/.env');
         }
@@ -684,6 +597,32 @@ const Crystal = () => {
     [fetchYouTubeByHappiness]
   );
 
+  const playMusicForScene = useCallback(
+    async (scene: 'romantic' | 'gym') => {
+      playlistModeRef.current = scene;
+      setCrystalHudScene(scene);
+      setLoading(true);
+      setError(null);
+      try {
+        const youtubeVideos = await fetchYouTubeByScene(scene);
+        if (youtubeVideos.length > 0) {
+          const [first, ...rest] = youtubeVideos;
+          setYoutubeQueue(rest);
+          setCurrentItem(first);
+          setSessionItems((prev) => [...prev, first]);
+          lastMusicRef.current = Date.now();
+        } else {
+          setError('No music available. Add YOUTUBE_API_KEY to server/.env');
+        }
+      } catch {
+        setError('Could not fetch music.');
+      } finally {
+        setLoading(false);
+      }
+    },
+    [fetchYouTubeByScene]
+  );
+
   const detectFace = useCallback(async () => {
     const video = videoRef.current;
     const overlayCanvas = overlayCanvasRef.current;
@@ -692,11 +631,48 @@ const Crystal = () => {
       return;
     }
 
+    const detector = poseDetectorRef.current;
+    if (poseReady && detector) {
+      poseFrameCounterRef.current += 1;
+      if (poseFrameCounterRef.current % POSE_EVERY_N_FRAMES === 0) {
+        try {
+          const poses = await detector.estimatePoses(video, { flipHorizontal: true });
+          const flexing = isDoubleFlexPose(poses[0]);
+          if (flexing) flexStreakRef.current += 1;
+          else flexStreakRef.current = 0;
+        } catch {
+          flexStreakRef.current = 0;
+        }
+      }
+    }
+
     try {
-      const result = await faceapi
-        .detectSingleFace(video, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.3 }))
+      const results = await faceapi
+        .detectAllFaces(video, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.3 }))
         .withFaceLandmarks()
         .withFaceExpressions();
+
+      if (results.length >= 2) duoStreakRef.current += 1;
+      else duoStreakRef.current = 0;
+
+      const desiredScene: CrystalHudScene =
+        flexStreakRef.current >= SCENE_STABLE_FRAMES
+          ? 'gym'
+          : duoStreakRef.current >= SCENE_STABLE_FRAMES
+            ? 'romantic'
+            : 'mood';
+      setCrystalHudScene(desiredScene);
+
+      const nowMs = Date.now();
+      if (desiredScene === 'gym' && playlistModeRef.current !== 'gym') {
+        lastMusicRef.current = nowMs;
+        void playMusicForScene('gym');
+      } else if (desiredScene === 'romantic' && playlistModeRef.current !== 'romantic') {
+        lastMusicRef.current = nowMs;
+        void playMusicForScene('romantic');
+      } else if (desiredScene === 'mood' && playlistModeRef.current !== 'mood') {
+        playlistModeRef.current = 'mood';
+      }
 
       const ctx = overlayCanvas.getContext('2d');
       if (ctx) {
@@ -719,7 +695,7 @@ const Crystal = () => {
         }
         ctx.clearRect(0, 0, displayWidth, displayHeight);
 
-        if (!result) {
+        if (results.length === 0) {
           ctx.font = '11px system-ui';
           ctx.fillStyle = 'rgba(255,255,255,0.5)';
           ctx.textAlign = 'center';
@@ -735,55 +711,73 @@ const Crystal = () => {
             y: p.y * scale - cropY,
           });
 
-          const box = result.detection.box;
-          const b = toDisplay({ x: box.x, y: box.y });
-          const bw = box.width * scale;
-          const bh = box.height * scale;
-          ctx.strokeStyle = 'rgba(0,255,245,0.9)';
-          ctx.lineWidth = 2;
-          ctx.strokeRect(b.x, b.y, bw, bh);
+          if (results.length >= 2) {
+            ctx.lineWidth = 2;
+            results.forEach((r) => {
+              const box = r.detection.box;
+              const b = toDisplay({ x: box.x, y: box.y });
+              const bw = box.width * scale;
+              const bh = box.height * scale;
+              ctx.strokeStyle = 'rgba(255,140,190,0.95)';
+              ctx.strokeRect(b.x, b.y, bw, bh);
+            });
+            ctx.font = '11px system-ui';
+            ctx.fillStyle = 'rgba(255,200,220,0.9)';
+            ctx.textAlign = 'center';
+            ctx.fillText('Two faces · romantic playlist', displayWidth / 2, displayHeight - 14);
+          } else {
+            const result = results[0];
+            const box = result.detection.box;
+            const b = toDisplay({ x: box.x, y: box.y });
+            const bw = box.width * scale;
+            const bh = box.height * scale;
+            ctx.strokeStyle = 'rgba(0,255,245,0.9)';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(b.x, b.y, bw, bh);
 
-          const landmarks = result.landmarks as faceapi.FaceLandmarks68;
-          const mouthIndices = new Set([48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
-          landmarks.positions.forEach((p, i) => {
-            const d = toDisplay(p);
+            const landmarks = result.landmarks as faceapi.FaceLandmarks68;
+            const mouthIndices = new Set([48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67]);
+            landmarks.positions.forEach((p, i) => {
+              const d = toDisplay(p);
+              ctx.beginPath();
+              ctx.arc(d.x, d.y, mouthIndices.has(i) ? 5 : 3, 0, Math.PI * 2);
+              ctx.fillStyle = mouthIndices.has(i) ? 'rgba(255,100,150,0.95)' : 'rgba(0,255,245,0.9)';
+              ctx.fill();
+              ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+              ctx.lineWidth = 1;
+              ctx.stroke();
+            });
+
+            const mouth = landmarks.getMouth();
+            ctx.strokeStyle = isSmiling(result.expressions) ? 'rgba(74,222,128,0.95)' : 'rgba(248,113,113,0.9)';
+            ctx.lineWidth = 2.5;
             ctx.beginPath();
-            ctx.arc(d.x, d.y, mouthIndices.has(i) ? 5 : 3, 0, Math.PI * 2);
-            ctx.fillStyle = mouthIndices.has(i) ? 'rgba(255,100,150,0.95)' : 'rgba(0,255,245,0.9)';
-            ctx.fill();
-            ctx.strokeStyle = 'rgba(255,255,255,0.9)';
-            ctx.lineWidth = 1;
+            mouth.forEach((p, i) => {
+              const d = toDisplay(p);
+              if (i === 0) ctx.moveTo(d.x, d.y);
+              else ctx.lineTo(d.x, d.y);
+            });
+            ctx.closePath();
             ctx.stroke();
-          });
 
-          const mouth = landmarks.getMouth();
-          ctx.strokeStyle = isSmiling(result.expressions) ? 'rgba(74,222,128,0.95)' : 'rgba(248,113,113,0.9)';
-          ctx.lineWidth = 2.5;
-          ctx.beginPath();
-          mouth.forEach((p, i) => {
-            const d = toDisplay(p);
-            if (i === 0) ctx.moveTo(d.x, d.y);
-            else ctx.lineTo(d.x, d.y);
-          });
-          ctx.closePath();
-          ctx.stroke();
+            if (result.expressions) {
+              const raw = happinessFromExpressions(result.expressions);
+              const ts = performance.now();
+              const dtS = Math.min(MAX_HAPPINESS_DT_S, (ts - lastHappinessSampleTsRef.current) / 1000);
+              lastHappinessSampleTsRef.current = ts;
+              const alpha = 1 - Math.exp(-dtS / HAPPINESS_SMOOTH_TIME_CONSTANT_S);
+              smoothedHappinessRef.current += (raw - smoothedHappinessRef.current) * alpha;
+              const smoothed = smoothedHappinessRef.current;
+              setHappiness(smoothed);
 
-          if (result.expressions) {
-            const raw = happinessFromExpressions(result.expressions);
-            const ts = performance.now();
-            const dtS = Math.min(MAX_HAPPINESS_DT_S, (ts - lastHappinessSampleTsRef.current) / 1000);
-            lastHappinessSampleTsRef.current = ts;
-            const alpha = 1 - Math.exp(-dtS / HAPPINESS_SMOOTH_TIME_CONSTANT_S);
-            smoothedHappinessRef.current += (raw - smoothedHappinessRef.current) * alpha;
-            const smoothed = smoothedHappinessRef.current;
-            setHappiness(smoothed);
-
-            const nowMs = Date.now();
-            const diff = Math.abs(smoothed - lastHappinessRef.current);
-            if (diff > HAPPINESS_MUSIC_JUMP_THRESHOLD && nowMs - lastMusicRef.current > HAPPINESS_DEBOUNCE_MS) {
-              lastHappinessRef.current = smoothed;
-              lastMusicRef.current = nowMs;
-              playMusicForHappiness(smoothed);
+              if (desiredScene === 'mood') {
+                const diff = Math.abs(smoothed - lastHappinessRef.current);
+                if (diff > HAPPINESS_MUSIC_JUMP_THRESHOLD && nowMs - lastMusicRef.current > HAPPINESS_DEBOUNCE_MS) {
+                  lastHappinessRef.current = smoothed;
+                  lastMusicRef.current = nowMs;
+                  playMusicForHappiness(smoothed);
+                }
+              }
             }
           }
         }
@@ -792,7 +786,7 @@ const Crystal = () => {
       /* ignore */
     }
     requestAnimationFrame(detectFace);
-  }, [modelsLoaded, playMusicForHappiness]);
+  }, [modelsLoaded, poseReady, playMusicForHappiness, playMusicForScene]);
 
   useEffect(() => {
     (async () => {
@@ -803,6 +797,42 @@ const Crystal = () => {
       await faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL);
       setModelsLoaded(true);
     })();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const tf = await import('@tensorflow/tfjs');
+        await import('@tensorflow/tfjs-backend-webgl');
+        const poseDetection = await import('@tensorflow-models/pose-detection');
+        await tf.setBackend('webgl');
+        await tf.ready();
+        const detector = await poseDetection.createDetector(poseDetection.SupportedModels.MoveNet, {
+          modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING,
+          enableSmoothing: true,
+        });
+        if (cancelled) {
+          detector.dispose();
+          return;
+        }
+        poseDetectorRef.current = detector;
+        setPoseReady(true);
+      } catch (e) {
+        console.warn('Crystal: pose model failed to load (gym flex mode disabled)', e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      const d = poseDetectorRef.current;
+      poseDetectorRef.current = null;
+      setPoseReady(false);
+      try {
+        d?.dispose();
+      } catch {
+        /* ignore */
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -822,7 +852,12 @@ const Crystal = () => {
       smoothedHappinessRef.current = 0.5;
       lastHappinessRef.current = 0.5;
       lastHappinessSampleTsRef.current = performance.now();
-      lastMusicRef.current = Date.now();
+      lastMusicRef.current = 0;
+      flexStreakRef.current = 0;
+      duoStreakRef.current = 0;
+      poseFrameCounterRef.current = 0;
+      playlistModeRef.current = 'mood';
+      setCrystalHudScene('mood');
       setHappiness(0.5);
       setCameraOn(true);
       setError(null);
@@ -845,7 +880,11 @@ const Crystal = () => {
       return;
     }
 
-    const videos = await fetchYouTubeByHappiness(smoothedHappinessRef.current);
+    const mode = playlistModeRef.current;
+    const videos =
+      mode === 'romantic' || mode === 'gym'
+        ? await fetchYouTubeByScene(mode)
+        : await fetchYouTubeByHappiness(smoothedHappinessRef.current);
     if (videos.length > 0) {
       const [first, ...rest] = videos;
       setYoutubeQueue(rest);
@@ -854,7 +893,7 @@ const Crystal = () => {
     } else {
       setCurrentItem(null);
     }
-  }, [fetchYouTubeByHappiness]);
+  }, [fetchYouTubeByHappiness, fetchYouTubeByScene]);
 
   const endSession = async () => {
     const video = videoRef.current;
@@ -878,7 +917,6 @@ const Crystal = () => {
               title: v.title,
               channelTitle: v.channelTitle ?? '',
             })),
-            spotifyMatches: spotifyMatches ?? undefined,
             playlist: playlistResult?.url
               ? { url: playlistResult.url, name: playlistResult.name ?? null }
               : null,
@@ -914,7 +952,7 @@ const Crystal = () => {
           className="retro-body text-[11px] mt-1 max-w-[340px]"
           style={{ color: 'rgba(160,196,240,0.45)' }}
         >
-          Your webcam reads your mood and plays music to match how you feel.
+          Mood from your face; two people trigger love songs; flex both arms for a gym playlist.
         </p>
       </div>
 
@@ -976,8 +1014,46 @@ const Crystal = () => {
             </p>
           )}
 
-          {/* Mood indicator */}
-          {sessionActive && (() => {
+          {/* Mood / duo / gym */}
+          {sessionActive && crystalHudScene === 'gym' && (
+            <div className="w-full space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="retro-title text-[10px]" style={{ color: '#f97316' }}>
+                  💪 Gym flex
+                </span>
+                <span className="retro-title text-[8px] tabular-nums text-orange-300/80">Workout</span>
+              </div>
+              <div className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+                <div
+                  className="h-full rounded-full w-full"
+                  style={{
+                    transition: 'background 1s ease-out',
+                    background: 'linear-gradient(90deg,#ea580c,#fb923c)',
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          {sessionActive && crystalHudScene === 'romantic' && (
+            <div className="w-full space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="retro-title text-[10px]" style={{ color: '#fb7185' }}>
+                  💕 Duo mode
+                </span>
+                <span className="retro-title text-[8px] tabular-nums text-pink-300/80">Romantic</span>
+              </div>
+              <div className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+                <div
+                  className="h-full rounded-full w-full"
+                  style={{
+                    transition: 'background 1s ease-out',
+                    background: 'linear-gradient(90deg,#db2777,#f472b6)',
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          {sessionActive && crystalHudScene === 'mood' && (() => {
             const mood = moodLabel(happiness);
             const color = happiness > 0.6 ? '#4ade80' : happiness < 0.4 ? '#f87171' : '#94a3b8';
             return (
@@ -1085,52 +1161,25 @@ const Crystal = () => {
 
             <p className="retro-body text-xs text-muted-foreground mb-4">
               {sessionItems.length > 0
-                ? `${sessionItems.length} video${sessionItems.length === 1 ? '' : 's'} · matching Spotify tracks…`
+                ? `${sessionItems.length} video${sessionItems.length === 1 ? '' : 's'} in this session. Save a YouTube playlist on your account.`
                 : 'No videos played.'}
             </p>
 
-            {sessionItems.length > 0 && resolveLoading && (
-              <div className="flex flex-col items-center gap-3 py-4">
-                <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-                <div className="retro-body text-xs text-muted-foreground space-y-1">
-                  {resolveProgress ? (
-                    <p className="text-foreground/90 tabular-nums">
-                      Matched {resolveProgress.current} of {resolveProgress.total} · {resolveElapsedSec}s
-                    </p>
-                  ) : (
-                    <p className="tabular-nums opacity-80">{resolveElapsedSec}s — waiting…</p>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {resolveError && (
-              <p className="retro-body text-xs text-red-400 mb-4 text-left">{resolveError}</p>
-            )}
-
-            {sessionItems.length > 0 && spotifyMatches && spotifyMatches.length > 0 && (
+            {sessionItems.length > 0 && (
               <div className="space-y-2 text-left mb-4 max-h-[min(40vh,260px)] overflow-y-auto pr-1">
-                {spotifyMatches.map((row, i) => (
-                  <div
+                {sessionItems.map((row, i) => (
+                  <a
                     key={`${row.videoId}-${i}`}
-                    className="rounded-md border border-white/10 bg-white/[0.03] p-2 space-y-0.5"
+                    href={`https://www.youtube.com/watch?v=${row.videoId}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block rounded-md border border-white/10 bg-white/[0.03] p-2 retro-body text-[11px] text-red-300/90 hover:bg-white/[0.06] line-clamp-2"
                   >
-                    <p className="retro-body text-[11px] text-blue-300/90 line-clamp-1">
-                      {i + 1}. {row.youtubeTitle}
-                    </p>
-                    {row.spotify ? (
-                      <a
-                        href={row.spotify.spotify_url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="block retro-body text-[11px] text-green-400/90 hover:underline"
-                      >
-                        {row.spotify.name} — {row.spotify.artist}
-                      </a>
-                    ) : (
-                      <p className="retro-body text-[10px] text-muted-foreground">No Spotify match</p>
-                    )}
-                  </div>
+                    {i + 1}. {row.title}
+                    {row.channelTitle ? (
+                      <span className="block text-[10px] text-muted-foreground mt-0.5">{row.channelTitle}</span>
+                    ) : null}
+                  </a>
                 ))}
               </div>
             )}
@@ -1140,45 +1189,41 @@ const Crystal = () => {
             )}
 
             {playlistResult && (
-              <div className="mb-4 rounded-md border border-green-500/30 bg-green-500/10 p-3 text-left">
-                <p className="retro-title text-[10px] text-green-400 mb-1">Playlist created</p>
+              <div className="mb-4 rounded-md border border-red-500/30 bg-red-950/20 p-3 text-left">
+                <p className="retro-title text-[10px] text-red-300 mb-1">YouTube playlist created</p>
                 <a
                   href={playlistResult.url}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="retro-body text-xs text-green-300 underline"
+                  className="retro-body text-xs text-red-200 underline"
                 >
-                  Open in Spotify
+                  Open in YouTube
                 </a>
               </div>
             )}
 
-            {sessionItems.length > 0 &&
-              spotifyMatches &&
-              !resolveLoading &&
-              !playlistResult &&
-              spotifyMatches.some((m) => m.spotify) && (
-                <button
-                  type="button"
-                  onClick={handleCreateSpotifyPlaylist}
-                  disabled={playlistLoading}
-                  className="retro-title mb-4 w-full rounded-sm py-2.5 text-[11px] transition-opacity disabled:opacity-50"
-                  style={{
-                    backgroundColor: 'hsla(var(--spotify-green) / 0.2)',
-                    color: 'hsl(var(--spotify-green))',
-                    border: '1px solid hsla(var(--spotify-green) / 0.35)',
-                  }}
-                >
-                  {playlistLoading ? (
-                    <span className="inline-flex items-center justify-center gap-2">
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Creating…
-                    </span>
-                  ) : (
-                    'Create Spotify playlist'
-                  )}
-                </button>
-              )}
+            {sessionItems.length > 0 && !playlistResult && (
+              <button
+                type="button"
+                onClick={handleCreateYouTubePlaylist}
+                disabled={playlistLoading}
+                className="retro-title mb-4 w-full rounded-sm py-2.5 text-[11px] transition-opacity disabled:opacity-50"
+                style={{
+                  backgroundColor: 'hsla(var(--youtube-red) / 0.22)',
+                  color: 'hsl(var(--youtube-red))',
+                  border: '1px solid hsla(var(--youtube-red) / 0.4)',
+                }}
+              >
+                {playlistLoading ? (
+                  <span className="inline-flex items-center justify-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Creating…
+                  </span>
+                ) : (
+                  'Create YouTube playlist'
+                )}
+              </button>
+            )}
 
             <button
               type="button"

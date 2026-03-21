@@ -5,18 +5,25 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
 const axios = require('axios');
 const {
-  getTopTracksForCountry,
-  createPlaylist,
   getTracksByMood,
-  COUNTRY_GENRES,
   resolveCrystalSessionVideosToSpotify,
   iterateCrystalSpotifyMatches,
   getSpotifyCooldownRemaining,
 } = require('./spotify');
+const { getTopVideosForCountry, COUNTRY_GENRES } = require('./youtube-globe');
+const { getYoutubeApiKeys, youtubeSearchWithFallback } = require('./youtube-search');
+const { isLyricVideo, isAllowedYoutubeMusicVideo, isInstrumentalOrLofi } = require('./youtube-filters');
+const { createYouTubePlaylist, isYouTubePlaylistConfigured } = require('./youtube-playlist');
 const { parseUserIntent, generatePlaylistDetails, generateReply, analyzeVibe, generateYouTubeSearchQuery, generateCrystalSessionPlaylistDetails, generateMoodSongReply, generateDigestMessage } = require('./agent');
 
 const app = express();
 app.use(express.json());
+
+/** Default 24h — each `/api/country` refresh can cost 100–200 YouTube search quota units. */
+const GLOBE_COUNTRY_CACHE_MS = Math.max(
+  60_000,
+  parseInt(process.env.GLOBE_COUNTRY_CACHE_MS || '', 10) || 24 * 60 * 60 * 1000,
+);
 
 /** Crystal sessions + Globe playlists — repo root `archive/` (JSON files). */
 const CRYSTAL_ARCHIVE_DIR = path.join(__dirname, '..', 'archive');
@@ -31,8 +38,7 @@ app.use((req, res, next) => {
 
 /**
  * In-memory cache for `/api/country` and `/api/create-playlist` (globe).
- * Populated only via Spotify Web API (`getTopTracksForCountry` in spotify.js).
- * Does not use YouTube — YOUTUBE_* keys are for Crystal Ball routes only.
+ * Populated via YouTube Data API search (`getTopVideosForCountry` in youtube-globe.js).
  */
 let globeData = {};
 
@@ -49,11 +55,15 @@ const GENRE_MOOD = {
   'bollywood':  { energy: 0.75, danceability: 0.82, valence: 0.76 },
 };
 
-/** Fetches top tracks from Spotify Search API for the given market; never calls YouTube. */
+/** Fetches trending-style music videos per country (YouTube Search + region bias). */
 async function refreshCountryData(countryCode) {
   try {
     const code = countryCode.toUpperCase();
-    const tracks = await getTopTracksForCountry(code);
+    if (getYoutubeApiKeys().length === 0) {
+      console.warn('refreshCountryData: set YOUTUBE_API_KEY in server/.env');
+      return;
+    }
+    const tracks = await getTopVideosForCountry(code);
     if (!tracks || tracks.length === 0) return;
 
     const genre = COUNTRY_GENRES[code] || 'pop';
@@ -76,15 +86,31 @@ async function refreshCountryData(countryCode) {
   }
 }
 
-app.get('/api/spotify-status', (req, res) => {
-  const cooldownMs = getSpotifyCooldownRemaining();
+app.get('/api/media-status', (req, res) => {
+  const keys = getYoutubeApiKeys();
+  const spotifyCd = getSpotifyCooldownRemaining();
   res.json({
-    ok: cooldownMs === 0,
-    cooldownMs,
-    cooldownMinutes: Math.ceil(cooldownMs / 60000),
-    message: cooldownMs > 0
-      ? `Spotify rate-limited — cooldown expires in ~${Math.ceil(cooldownMs / 60000)} minutes`
-      : 'Spotify API available',
+    youtubeSearchConfigured: keys.length > 0,
+    youtubePlaylistOAuth: isYouTubePlaylistConfigured(),
+    spotifySearchCooldownMs: spotifyCd,
+    spotifySearchCooldownMinutes: Math.ceil(spotifyCd / 60000),
+  });
+});
+
+/** @deprecated use /api/media-status */
+app.get('/api/spotify-status', (req, res) => {
+  const keys = getYoutubeApiKeys();
+  const spotifyCd = getSpotifyCooldownRemaining();
+  res.json({
+    ok: keys.length > 0 && isYouTubePlaylistConfigured(),
+    cooldownMs: spotifyCd,
+    cooldownMinutes: Math.ceil(spotifyCd / 60000),
+    message:
+      keys.length === 0
+        ? 'Set YOUTUBE_API_KEY (globe + Crystal search) and YouTube OAuth for playlists — see server/.env.example'
+        : isYouTubePlaylistConfigured()
+          ? 'YouTube search + playlist OAuth configured'
+          : 'YouTube search OK; add YouTube OAuth (YOUTUBE_OAUTH_REFRESH_TOKEN) to create playlists',
   });
 });
 
@@ -96,15 +122,13 @@ app.get('/api/globe-data', (req, res) => {
 app.get('/api/country/:code', async (req, res) => {
   const code = req.params.code.toUpperCase();
   const cached = globeData[code];
-  const maxAgeMs = 60 * 60 * 1000;
-  const isFresh = cached && (Date.now() - new Date(cached.updatedAt).getTime() < maxAgeMs);
+  const isFresh = cached && (Date.now() - new Date(cached.updatedAt).getTime() < GLOBE_COUNTRY_CACHE_MS);
 
   let servedStale = false;
   if (!isFresh) {
     try {
       await Promise.race([
         refreshCountryData(code),
-        // Allow Spotify 429 Retry-After + retries (see spotify.js spotifyGet).
         new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 45000)),
       ]);
     } catch (err) {
@@ -115,7 +139,10 @@ app.get('/api/country/:code', async (req, res) => {
 
   const data = globeData[code];
   if (!data) {
-    return res.status(404).json({ error: 'Country not found — Spotify may be rate-limiting. Try again in a moment.' });
+    return res.status(404).json({
+      error:
+        'No videos for this country yet — set YOUTUBE_API_KEY in server/.env, or try again in a moment.',
+    });
   }
   if (servedStale) res.setHeader('X-Country-Data-Stale', '1');
   res.json(data);
@@ -133,98 +160,7 @@ app.post('/api/vibe-analyze', async (req, res) => {
   }
 });
 
-// --- YouTube Data API (Crystal Ball: /api/youtube-*, browser playback). Not used for globe/country. ---
-
-function isLyricVideo(item) {
-  const title = (item.snippet?.title || '').toLowerCase();
-  const desc = (item.snippet?.description || '').toLowerCase();
-  const combined = `${title} ${desc}`;
-  return /\blyric\b|lyrics\s*video/i.test(combined);
-}
-
-/**
- * Drop playlist-style uploads, remixes, covers, karaoke, and common reupload edits.
- * (Official re-records like "Taylor's Version" stay allowed.)
- */
-function isExcludedPlaylistRemixCover(item) {
-  const titleRaw = item.snippet?.title || '';
-  const title = titleRaw.toLowerCase();
-  const desc = (item.snippet?.description || '').toLowerCase().slice(0, 1000);
-  const channel = (item.snippet?.channelTitle || '').toLowerCase();
-  const blob = `${title} ${desc} ${channel}`;
-
-  if (/taylor['’]s\s+version\b/i.test(titleRaw)) return false;
-
-  // Playlist / mega-compilation style videos (still type=video on YouTube)
-  if (
-    /\bplaylist\b|\bplaylists\b|\bfull\s+album\b|\bcomplete\s+album\b|\bentire\s+album\b|\ball\s+songs\b|\bnon-?stop\b|\b\d+\s*hours?\b|\bhours?\s+of\b|\bhour\s+loop\b|\bmega\s+mix\b|\bgreatest\s+hits\b|\bdiscography\b|\bcompilation\b|\bsupercut\b|\b\d+\s*songs?\s+in\b|\btop\s+\d+\s+songs\b|\b100\s+songs\b|\bmix\s*202\d\b/i.test(
-      blob,
-    )
-  ) {
-    return true;
-  }
-
-  // Remixes, edits, meme audio
-  if (
-    /\bremix\b|\brmx\b|\bmash-?up\b|\bmashup\b|\bnightcore\b|\b8d\s+audio\b|\b8d\s+sound\b|\bslowed\s*(down|reverb|\+)?\b|\bsped\s*up\b|\bspeed\s*(up|song)\b|\bfan\s+edit\b|\btik\s*tok\s+version\b|\bvc\b|\bedit\s*audio\b|\bbootleg\b|\bextended\s+mix\b|\bclub\s+mix\b|\bdance\s+mix\b|\bphonk\b|\btype\s+beat\b/i.test(
-      blob,
-    )
-  ) {
-    return true;
-  }
-
-  // Covers, karaoke, tributes, reaction-style
-  if (
-    /\bcover\b|\bcovers\b|\bcovered\s+by\b|\bkaraoke\b|\bpiano\s+cover\b|\bacoustic\s+cover\b|\borchestral\s+cover\b|\bfemale\s+cover\b|\bmale\s+cover\b|\btribute\b|\bnot\s+official\b|\bfan\s+cover\b|\breaction\s+to\b|\breacts\s+to\b|\blive\s+cover\b/i.test(
-      blob,
-    )
-  ) {
-    return true;
-  }
-
-  // Channels that mostly publish non-original audio
-  if (
-    /\b(karaoke|cover|covers|remix|nightcore|mashup|sped\s*up|slowed|8d|instrumental)\b/i.test(channel) &&
-    !/\bvevo\b|\brecords\b|\bmusic\b.*\bofficial\b/i.test(channel)
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-function isAllowedYoutubeMusicVideo(item) {
-  return Boolean(item?.id?.videoId) && !isExcludedPlaylistRemixCover(item);
-}
-
-function isKeyError(err) {
-  const status = err.response?.status;
-  const code = err.response?.data?.error?.code;
-  return status === 403 || status === 401 || code === 403 || code === 401;
-}
-
-async function youtubeSearch(query, key, maxResults = 20) {
-  const { data } = await axios.get('https://www.googleapis.com/youtube/v3/search', {
-    params: { part: 'snippet', q: query, type: 'video', videoCategoryId: '10', maxResults, key },
-  });
-  return data;
-}
-
-async function youtubeSearchWithFallback(query) {
-  const keys = [process.env.YOUTUBE_API_KEY, process.env.YOUTUBE_API_KEY_2].filter(Boolean);
-  if (keys.length === 0) return null;
-  let lastErr;
-  for (const key of keys) {
-    try {
-      return await youtubeSearch(query, key);
-    } catch (err) {
-      lastErr = err;
-      if (isKeyError(err) && keys.indexOf(key) < keys.length - 1) continue;
-      throw err;
-    }
-  }
-  throw lastErr;
-}
+// --- YouTube Data API (Crystal Ball + shared search helper in youtube-search.js) ---
 
 /**
  * Specific artist + song queries per mood bracket so YouTube returns
@@ -284,59 +220,95 @@ const NEUTRAL_QUERIES = [
   'Daniel Caesar Best Part official video',
 ];
 
-function isInstrumentalOrLofi(item) {
-  const title = (item.snippet?.title || '').toLowerCase();
-  const channel = (item.snippet?.channelTitle || '').toLowerCase();
-  const desc = (item.snippet?.description || '').toLowerCase().slice(0, 600);
-  const blob = `${title} ${channel} ${desc}`;
-  return /\binstrumental\b|\blofi\b|\blo-fi\b|\blo fi\b|\bpiano\s+version\b|\bstudy\s+music\b|\bsleep\s+music\b|\bmeditation\b|\bambient\b|\bbackground\s+music\b|\bno\s+vocals\b|\bbeat\s+only\b|\binstrumental\s+version\b|\brelaxing\s+piano\b/i.test(blob);
+/** Crystal Ball: two faces on camera → love songs */
+const CRYSTAL_ROMANTIC_QUERIES = [
+  'Ed Sheeran Perfect official music video',
+  'John Legend All of Me official music video',
+  'Taylor Swift Lover official music video',
+  'Bruno Mars Just The Way You Are official music video',
+  'Adele Make You Feel My Love official music video',
+  'Christina Perri A Thousand Years official music video',
+  'James Arthur Say You Won\'t Let Go official music video',
+  'Shawn Mendes Fallin All In You official music video',
+  'Ellie Goulding Love Me Like You Do official music video',
+  'Lady Gaga Shallow official music video',
+  'Calum Scott Dancing On My Own official music video',
+  'Lewis Capaldi Someone You Loved official music video',
+  'Sam Smith Stay With Me official music video',
+  'Rihanna Stay official music video',
+  'The Weeknd Earned It official music video',
+];
+
+/** Crystal Ball: arms-flex pose → high-energy / workout tracks */
+const CRYSTAL_GYM_QUERIES = [
+  'Survivor Eye of the Tiger official music video',
+  'Eminem Till I Collapse official music video',
+  'Kanye West Stronger official music video',
+  'David Guetta Titanium ft Sia official music video',
+  'Imagine Dragons Believer official music video',
+  'Dua Lipa Levitating official music video',
+  'Megan Thee Stallion Savage official music video',
+  'DJ Snake Turn Down for What official music video',
+  'Kendrick Lamar HUMBLE official music video',
+  'ACDC Thunderstruck official music video',
+  'Queen We Will Rock You official music video',
+  'Europe The Final Countdown official music video',
+  'Technotronic Pump Up The Jam official music video',
+  'Black Eyed Peas Let\'s Get It Started official music video',
+  '2 Unlimited Get Ready For This official music video',
+];
+
+/**
+ * One YouTube search per call (100 quota units). Shared by mood + scene Crystal endpoints.
+ * @param {string[]} pool
+ */
+async function pickVideosForCrystalQueryPool(pool) {
+  const picked = [...pool].sort(() => Math.random() - 0.5).slice(0, 1);
+  const allItems = [];
+  for (const query of picked) {
+    try {
+      const data = await youtubeSearchWithFallback(query, 50);
+      if (data?.items) allItems.push(...data.items);
+    } catch {
+      /* skip failed query */
+    }
+  }
+
+  const candidates = allItems
+    .filter(isAllowedYoutubeMusicVideo)
+    .filter((v) => !isInstrumentalOrLofi(v));
+
+  const seen = new Set();
+  const unique = [];
+  for (const v of candidates) {
+    if (!seen.has(v.id.videoId)) {
+      seen.add(v.id.videoId);
+      unique.push(v);
+    }
+  }
+
+  const lyricItems = unique.filter(isLyricVideo);
+  const chosen = (lyricItems.length >= 3 ? lyricItems : unique).slice(0, 5);
+
+  return chosen.map((v) => ({
+    videoId: v.id.videoId,
+    title: v.snippet?.title || 'Music',
+    channelTitle: v.snippet?.channelTitle || '',
+  }));
 }
 
 app.post('/api/youtube-by-happiness', async (req, res) => {
   try {
-    const keys = [process.env.YOUTUBE_API_KEY, process.env.YOUTUBE_API_KEY_2].filter(Boolean);
-    if (keys.length === 0) return res.status(503).json({ error: 'YOUTUBE_API_KEY not set' });
+    if (getYoutubeApiKeys().length === 0) return res.status(503).json({ error: 'YOUTUBE_API_KEY not set' });
 
     const h = Math.max(0, Math.min(1, parseFloat(req.body.happiness) || 0.5));
     const pool = h > 0.6 ? HAPPY_QUERIES : h < 0.4 ? SAD_QUERIES : NEUTRAL_QUERIES;
 
-    // Pick 3 random queries from the pool, search each, merge results
-    const picked = [...pool].sort(() => Math.random() - 0.5).slice(0, 3);
-    const allItems = [];
-    for (const query of picked) {
-      try {
-        const data = await youtubeSearchWithFallback(query);
-        if (data?.items) allItems.push(...data.items);
-      } catch { /* skip failed query */ }
-    }
-
-    const candidates = allItems
-      .filter(isAllowedYoutubeMusicVideo)
-      .filter(v => !isInstrumentalOrLofi(v));
-
-    // Dedupe by videoId
-    const seen = new Set();
-    const unique = [];
-    for (const v of candidates) {
-      if (!seen.has(v.id.videoId)) {
-        seen.add(v.id.videoId);
-        unique.push(v);
-      }
-    }
-
-    // Prefer lyrics / official videos
-    const lyricItems = unique.filter(isLyricVideo);
-    const chosen = (lyricItems.length >= 3 ? lyricItems : unique).slice(0, 5);
-
-    const videos = chosen.map((v) => ({
-      videoId: v.id.videoId,
-      title: v.snippet?.title || 'Music',
-      channelTitle: v.snippet?.channelTitle || '',
-    }));
+    const videos = await pickVideosForCrystalQueryPool(pool);
     if (videos.length === 0) {
       return res.status(404).json({ error: 'No video found' });
     }
-    console.log(`[Crystal] happiness=${h.toFixed(2)} → ${videos.map(v => v.title).join(' | ')}`);
+    console.log(`[Crystal] happiness=${h.toFixed(2)} → ${videos.map((v) => v.title).join(' | ')}`);
     res.json({ videos });
   } catch (err) {
     console.error('YouTube by happiness error:', err.message, err.response?.data);
@@ -344,9 +316,31 @@ app.post('/api/youtube-by-happiness', async (req, res) => {
   }
 });
 
+app.post('/api/youtube-crystal-scene', async (req, res) => {
+  try {
+    if (getYoutubeApiKeys().length === 0) return res.status(503).json({ error: 'YOUTUBE_API_KEY not set' });
+
+    const scene = req.body?.scene;
+    if (scene !== 'romantic' && scene !== 'gym') {
+      return res.status(400).json({ error: 'scene must be "romantic" or "gym"' });
+    }
+
+    const pool = scene === 'romantic' ? CRYSTAL_ROMANTIC_QUERIES : CRYSTAL_GYM_QUERIES;
+    const videos = await pickVideosForCrystalQueryPool(pool);
+    if (videos.length === 0) {
+      return res.status(404).json({ error: 'No video found' });
+    }
+    console.log(`[Crystal] scene=${scene} → ${videos.map((v) => v.title).join(' | ')}`);
+    res.json({ videos });
+  } catch (err) {
+    console.error('YouTube crystal scene error:', err.message, err.response?.data);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/youtube-by-vibe', async (req, res) => {
   try {
-    const keys = [process.env.YOUTUBE_API_KEY, process.env.YOUTUBE_API_KEY_2].filter(Boolean);
+    const keys = getYoutubeApiKeys();
     if (keys.length === 0) return res.status(503).json({ error: 'YOUTUBE_API_KEY not set' });
 
     const vibe = await analyzeVibe(req.body.text || 'chill music');
@@ -392,11 +386,14 @@ app.post('/api/tracks-by-mood', async (req, res) => {
 
 app.get('/api/debug-previews', async (req, res) => {
   try {
-    const us = await getTopTracksForCountry('US');
+    if (getYoutubeApiKeys().length === 0) {
+      return res.status(503).json({ error: 'YOUTUBE_API_KEY not set' });
+    }
+    const us = await getTopVideosForCountry('US');
     const sample = us.slice(0, 5).map((t) => ({
       name: t.name,
       artist: t.artist,
-      hasPreview: !!t.preview_url,
+      youtube_url: t.youtube_url,
     }));
     res.json({ usSample: sample, total: us.length });
   } catch (err) {
@@ -406,6 +403,11 @@ app.get('/api/debug-previews', async (req, res) => {
 
 app.post('/api/crystal-youtube-to-spotify', async (req, res) => {
   try {
+    if (!process.env.SPOTIFY_REFRESH_TOKEN) {
+      return res.status(503).json({
+        error: 'Spotify matching is optional and not configured. Use “Create YouTube playlist” in Crystal instead.',
+      });
+    }
     const { videos } = req.body;
     if (!Array.isArray(videos) || videos.length === 0) {
       return res.status(400).json({ error: 'videos array required' });
@@ -563,31 +565,47 @@ app.get('/api/archive', async (_req, res) => {
 
 app.post('/api/create-session-playlist', async (req, res) => {
   try {
-    const { trackIds = [], tracks = [], name } = req.body;
-    const ids = Array.isArray(trackIds) ? trackIds : [];
-    const trackList = Array.isArray(tracks) ? tracks : [];
-    const allIds = ids.length > 0 ? ids : trackList.map((t) => t.id).filter(Boolean);
-    if (allIds.length === 0) {
-      return res.status(400).json({ error: 'trackIds or tracks array required' });
+    const { videoIds = [], videos = [], name } = req.body;
+    const vids = Array.isArray(videoIds) ? videoIds.filter(Boolean) : [];
+    const videoRows = Array.isArray(videos) ? videos : [];
+    const allVideoIds =
+      vids.length > 0
+        ? vids.map((id) => String(id))
+        : videoRows.map((v) => String(v.videoId || v.id || '')).filter(Boolean);
+    if (allVideoIds.length === 0) {
+      return res.status(400).json({ error: 'videoIds or videos[{ videoId }] required' });
     }
     let playlistName = name;
-    let playlistDesc = 'Songs from your Crystal Ball session · GlobeMeta';
-    if (trackList.length > 0) {
+    let playlistDesc = 'Videos from your Crystal Ball session · GlobeMeta';
+    if (videoRows.length > 0) {
+      const forClaude = videoRows.map((v) => ({
+        name: v.title || v.name || 'Video',
+        artist: v.channelTitle || v.artist || '',
+      }));
       try {
-        const details = await generateCrystalSessionPlaylistDetails(trackList);
+        const details = await generateCrystalSessionPlaylistDetails(forClaude);
         playlistName = details.name;
         playlistDesc = details.description;
       } catch (e) {
         console.warn('Crystal playlist details fallback:', e.message);
       }
     }
-    const trackUris = allIds.map((id) => `spotify:track:${id}`);
-    const url = await createPlaylist(playlistName || 'My Crystal Ball Session', playlistDesc, trackUris);
+    const url = await createYouTubePlaylist(
+      playlistName || 'GlobeMeta Crystal Ball',
+      playlistDesc,
+      allVideoIds,
+    );
     res.json({ url, name: playlistName });
   } catch (err) {
     const detail = err.response?.data || err.message;
     console.error('Session playlist error:', detail);
-    res.status(500).json({ error: typeof detail === 'string' ? detail : JSON.stringify(detail) });
+    const msg =
+      err.code === 'YOUTUBE_OAUTH_MISSING'
+        ? err.message
+        : typeof detail === 'string'
+          ? detail
+          : JSON.stringify(detail);
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -600,8 +618,8 @@ app.post('/api/create-playlist', async (req, res) => {
     if (!countryData) return res.status(404).json({ error: 'No data for this country' });
 
     const details = await generatePlaylistDetails(countryData.country, countryData.tracks);
-    const trackUris = countryData.tracks.map(t => `spotify:track:${t.id}`);
-    const url = await createPlaylist(details.name, details.description, trackUris);
+    const videoIds = countryData.tracks.map((t) => t.id).filter(Boolean);
+    const url = await createYouTubePlaylist(details.name, details.description, videoIds);
     const trackList = countryData.tracks.slice(0, 10).map((t, i) => formatLuffaTrackLine(i + 1, t.name, t.artist));
 
     // Notify Luffa users about the new playlist
@@ -649,7 +667,13 @@ app.post('/api/create-playlist', async (req, res) => {
   } catch (err) {
     const detail = err.response?.data || err.message;
     console.error('Create playlist error:', detail);
-    res.status(500).json({ error: typeof detail === 'string' ? detail : JSON.stringify(detail) });
+    const msg =
+      err.code === 'YOUTUBE_OAUTH_MISSING'
+        ? err.message
+        : typeof detail === 'string'
+          ? detail
+          : JSON.stringify(detail);
+    res.status(500).json({ error: msg });
   }
 });
 
@@ -793,8 +817,11 @@ async function processMusicBotMessage(messageText, fallbackCountryCode = null) {
 
     if (intent.intent === 'create_playlist') {
       const details = await generatePlaylistDetails(cd.country, cd.tracks);
-      const trackUris = cd.tracks.map(t => `spotify:track:${t.id}`);
-      const playlistUrl = await createPlaylist(details.name, details.description, trackUris);
+      const playlistUrl = await createYouTubePlaylist(
+        details.name,
+        details.description,
+        cd.tracks.map((t) => t.id).filter(Boolean),
+      );
       const trackList = cd.tracks.slice(0, 10).map((t, i) => formatLuffaTrackLine(i + 1, t.name, t.artist)).join('\n');
       return {
         text: `GlobeMeta\n${details.message}\n\n${details.name}\n${playlistUrl}\n\n${trackList}`,
@@ -813,8 +840,13 @@ async function processMusicBotMessage(messageText, fallbackCountryCode = null) {
     };
   }
 
-  // Crystal Ball on Luffa — user texts a mood, bot replies with a matched song
+  // Crystal Ball on Luffa — user texts a mood, bot replies with a matched song (Spotify search; optional)
   if (intent.intent === 'crystal_mood' && intent.mood) {
+    if (!process.env.SPOTIFY_REFRESH_TOKEN) {
+      return {
+        text: `Mood matching in chat uses Spotify on the server (not configured). For YouTube + webcam, try the Crystal Ball: ${PUBLIC_APP_URL}/crystal`,
+      };
+    }
     try {
       const vibe = await analyzeVibe(intent.mood);
       const tracks = await getTracksByMood(vibe.energy, vibe.valence, vibe.danceability);
@@ -828,6 +860,19 @@ async function processMusicBotMessage(messageText, fallbackCountryCode = null) {
 
   // Detect mood-like messages even when Claude classifies as "unknown"
   if (intent.intent === 'unknown' && intent.mood) {
+    if (!process.env.SPOTIFY_REFRESH_TOKEN) {
+      let countryDataEarly = null;
+      if (code) {
+        if (!globeData[code]) await refreshCountryData(code);
+        countryDataEarly = globeData[code];
+      }
+      try {
+        const reply = await generateReply(messageText, { countryData: countryDataEarly, countryCode: code });
+        return { text: reply };
+      } catch {
+        return { text: luffaFallbackReply(messageText) };
+      }
+    }
     try {
       const vibe = await analyzeVibe(intent.mood);
       const tracks = await getTracksByMood(vibe.energy, vibe.valence, vibe.danceability);
@@ -863,6 +908,8 @@ const LUFFA_MSGID_DEDUPE_MAX = 500;
 const seenMsgIds = new Set();
 const msgIdQueue = [];
 let luffaLastNetworkErrorLog = 0;
+/** Throttle repeated Luffa /receive error bodies (e.g. code 500) so logs stay readable. */
+let luffaLastReceiveApiErrorLog = 0;
 /** Throttle “still polling” lines so the console isn’t silent, without logging every 1s. */
 let luffaLastHeartbeatLog = 0;
 const LUFFA_HEARTBEAT_MS = 15000;
@@ -1009,7 +1056,26 @@ async function pollLuffa() {
 
     if (!Array.isArray(data)) {
       if (data && typeof data === 'object' && Object.keys(data).length > 0) {
-        console.log('Luffa receive (unexpected shape):', JSON.stringify(data).slice(0, 400));
+        const apiCode = data.code;
+        const hasErrorCode =
+          apiCode !== undefined && apiCode !== null && Number(apiCode) !== 0;
+        if (hasErrorCode) {
+          const nowErr = Date.now();
+          if (nowErr - luffaLastReceiveApiErrorLog > 60000) {
+            luffaLastReceiveApiErrorLog = nowErr;
+            const errText =
+              typeof data.msg === 'string'
+                ? data.msg
+                : typeof data.message === 'string'
+                  ? data.message
+                  : '';
+            console.warn(
+              `[Luffa] /receive API error (their backend): HTTP OK but code=${apiCode}${errText ? ` — ${errText.slice(0, 240)}` : ''}. Check robot key / Luffa dashboard or retry later.`,
+            );
+          }
+        } else {
+          console.log('Luffa receive (unexpected shape):', JSON.stringify(data).slice(0, 400));
+        }
       }
       return;
     }
@@ -1262,6 +1328,12 @@ async function runLuffaShowcaseFeature(kind, uid, isGroup) {
 
   try {
     if (kind === 'mood') {
+      if (!process.env.SPOTIFY_REFRESH_TOKEN) {
+        await toUser(
+          'SHOWCASE-MOOD needs Spotify credentials (optional). Globe + YouTube playlists work with YOUTUBE_* + Google OAuth only.',
+        );
+        return;
+      }
       await toUser('Quick demo: matching a song for a hyped, party ready mood…');
       const sampleMood = 'excited and ready to party';
       const vibe = await analyzeVibe(sampleMood);
@@ -1286,8 +1358,8 @@ async function runLuffaShowcaseFeature(kind, uid, isGroup) {
       case 'playlist':
         await notifyLuffaPlaylistCreated(
           'Japan',
-          'GlobeMeta demo: Tokyo',
-          'https://open.spotify.com/playlist/37i9dQZEVXbMDoHDwVN2tF',
+          'GlobeMeta demo: Tokyo (YouTube)',
+          'https://www.youtube.com/results?search_query=japan+music+official',
           [
             '1. Idol · YOASOBI',
             '2. 夜に駆ける · YOASOBI',

@@ -68,7 +68,7 @@ const Index = () => {
           className="retro-body text-[11px] mt-1 max-w-[340px]"
           style={{ color: 'rgba(160,196,240,0.45)' }}
         >
-          Spin the globe, click any country, and explore its trending tracks.
+          Spin the globe, click any country, and explore trending music on YouTube.
         </p>
       </div>
 

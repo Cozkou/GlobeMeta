@@ -1,6 +1,6 @@
 # GlobeMeta
 
-A **3D globe** for exploring country trending tracks (Spotify), a **Crystal Ball** session with webcam mood → music (YouTube + optional Spotify playlists), a **home** mini-game, and an optional **Luffa** chat bot that mirrors many of those flows.
+A **3D globe** for exploring country trending music (**YouTube** search + regional bias), a **Crystal Ball** session with webcam mood → music (YouTube playback + **YouTube playlists** on your account), a **home** mini-game, and an optional **Luffa** chat bot that mirrors many of those flows.
 
 ## Quick start
 
@@ -17,7 +17,7 @@ cd server && npm install && node index.js   # default http://127.0.0.1:4000
 npm run dev
 ```
 
-Copy **`server/.env.example`** → **`server/.env`** and fill in at least **Spotify** credentials for globe/country data and playlists. For Crystal Ball video search, add **YouTube** API key(s). See **Environment** below.
+Copy **`server/.env.example`** → **`server/.env`** and fill in at least **`YOUTUBE_API_KEY`** for globe + Crystal search. For **creating playlists** (globe + Crystal), add **Google OAuth** credentials and run **`node youtube-auth.js`** once to obtain **`YOUTUBE_OAUTH_REFRESH_TOKEN`**. If Google returns **403 access_denied**, add your Gmail under **OAuth consent screen → Test users** while the app is in **Testing**. See **Environment** below.
 
 **Production build:** `npm run build` then `npm run preview` — note that **`vite preview`** uses a proxy for `/api` in this repo so API calls still reach your local server when configured.
 
@@ -29,8 +29,9 @@ Full comments live in **`server/.env.example`**. Summary:
 
 | Variable | Purpose |
 |----------|---------|
-| `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `SPOTIFY_REFRESH_TOKEN` | Country top tracks, create playlists, mood search |
-| `YOUTUBE_API_KEY` (+ optional `_2`) | Crystal Ball YouTube search / embed |
+| `YOUTUBE_API_KEY` (+ optional `_2`) | Globe country picks + Crystal Ball YouTube search |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `YOUTUBE_OAUTH_REFRESH_TOKEN` | Create **YouTube** playlists (OAuth; use `node youtube-auth.js`) |
+| `SPOTIFY_*` (optional) | Luffa mood matching + optional **`/api/crystal-youtube-to-spotify`** only |
 | `CLAUDE_API_KEY` | Luffa intents, replies, digest copy (optional but recommended for the bot) |
 | `LUFFA_BOT_SECRET` | Luffa robot key — enables polling bot |
 | `LUFFA_POLL_MS` | Poll interval ms (default ~700; range 250–3000) |
@@ -46,8 +47,8 @@ Never commit real `.env` files or tokens.
 ## App routes (frontend)
 
 - **`/`** — Home (Piano Tiles background + Enter)
-- **`/globe`** — Globe Mixer: spin globe, click countries, trending tracks, create Spotify playlist
-- **`/crystal`** — Crystal Ball: webcam + mood-driven music, archive session
+- **`/globe`** — Globe Mixer: spin globe, click countries, trending YouTube picks, create **YouTube** playlist
+- **`/crystal`** — Crystal Ball: webcam + mood-driven music, archive session, **YouTube** playlist from session videos
 - **`/archive`** — Lists saved Globe playlists and Crystal Ball sessions from the server (`GET /api/archive`)
 
 ---
@@ -62,9 +63,9 @@ Luffa uses **polling**, not webhooks. The server calls `https://apibot.luffa.im/
 
 ### User-facing bot behavior
 
-- **Country playlist** — e.g. “make a playlist from Brazil” → creates a Spotify playlist; reply includes the **playlist URL** (plain text so clients can linkify it).
-- **Trending / vibe** — top tracks or energy/danceability/valence for a named country.
-- **Crystal Ball via chat** — mood-style messages → `analyzeVibe` + Spotify mood search → reply with matched tracks and links (**real data**, not mock).
+- **Country playlist** — e.g. “make a playlist from Brazil” → creates a **YouTube** playlist (needs OAuth env); reply includes the **playlist URL** (plain text so clients can linkify it).
+- **Trending / vibe** — top picks or energy/danceability/valence for a named country (YouTube-backed globe cache).
+- **Crystal Ball via chat** — mood-style messages → `analyzeVibe` + **optional Spotify** mood search → reply with links (**requires** `SPOTIFY_REFRESH_TOKEN`).
 - **Scheduled (mock for demos):**
   - **Daily digest** (~9:00 local server time) — “what the world is vibing to” (mock track list + optional Claude copy).
   - **Globe alerts** (every few hours) — mock “genre/artist spike in a country”.
@@ -84,15 +85,16 @@ When someone creates a playlist from the **website** (`POST /api/create-playlist
 | `SHOWCASE-ALERT` | Sends a **globe alert** immediately (mock, broadcast). |
 | `SHOWCASE-BATTLE` | Starts a **country battle** poll immediately (broadcast). |
 | `SHOWCASE-PLAYLIST` | Sends a **demo** “new playlist” notification with a sample link (broadcast). |
-| `SHOWCASE-MOOD` | Runs **Crystal Ball mood matching** once with a fixed sample line (“excited and ready to party”) — **real Spotify**; replies to **you** (not a full broadcast). |
+| `SHOWCASE-MOOD` | Runs **Crystal Ball mood matching** once — **requires Spotify** in `.env`; replies to **you** (not a full broadcast). |
 
 Do not rely on these in production; remove or gate them if you ship beyond a hackathon.
 
 ---
 
-## Spotify rate limits
+## API / quota notes
 
-Heavy or duplicate API usage can trigger **HTTP 429** from Spotify with long `Retry-After` cooldowns. The server includes backoff and a global cooldown helper — if country data fails, check server logs and avoid running **multiple** `node index.js` processes against the same Spotify app.
+- **YouTube Data API** — Search + playlist writes consume **quota units**. For hackathon scale, defaults are usually enough; avoid hammering the API from many parallel clients.
+- **Spotify (optional)** — If enabled, heavy usage can trigger **HTTP 429**; the server includes backoff helpers for search.
 
 ---
 
@@ -100,18 +102,18 @@ Heavy or duplicate API usage can trigger **HTTP 429** from Spotify with long `Re
 
 JSON files live under **`archive/`** at the repo root (gitignored).
 
-- **`POST /api/crystal-archive`** — Crystal Ball “End & save”: stores session videos, optional Spotify matches, and optional playlist link.
-- **`POST /api/create-playlist`** (Globe) — After a Spotify playlist is created, a **`globe-*.json`** entry is written with the playlist URL, country, and a short track preview list.
+- **`POST /api/crystal-archive`** — Crystal Ball “End & save”: stores session videos and optional playlist link (legacy field may include old Spotify match rows).
+- **`POST /api/create-playlist`** (Globe) — After a **YouTube** playlist is created, a **`globe-*.json`** entry is written with the playlist URL, country, and a short track preview list.
 - **`GET /api/archive`** — Lists all entries (newest first) for the **`/archive`** page.
 
-Tune Crystal Spotify matching with **`CRYSTAL_SPOTIFY_LOOKUP_MS`** in `server/.env` if needed.
+Optional: tune legacy Crystal→Spotify matching with **`CRYSTAL_SPOTIFY_LOOKUP_MS`** in `server/.env` if `SPOTIFY_*` is set.
 
 ---
 
 ## Tech stack (high level)
 
 - **Frontend:** React, TypeScript, Vite, Tailwind, React Router, Three.js (globe), face-api (Crystal Ball).
-- **Backend:** Node.js, Express, Spotify Web API, YouTube Data API, optional Anthropic (Claude), Luffa HTTP polling.
+- **Backend:** Node.js, Express, YouTube Data API (+ OAuth for playlists), optional Spotify Web API, optional Anthropic (Claude), Luffa HTTP polling.
 
 ---
 

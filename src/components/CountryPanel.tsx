@@ -1,7 +1,56 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Link } from 'react-router-dom';
-import { X, Play, Pause, Loader2, Music } from 'lucide-react';
+import { X, Play, Pause, Loader2, Music, ExternalLink } from 'lucide-react';
 import { COUNTRY_NAME_TO_CODE, COUNTRY_META, resolveCountryCode } from '@/data/countryData';
+import { loadYoutubeIframeApi } from '@/lib/youtubeIframeApi';
+
+const YT_STATE_PLAYING = 1;
+
+type YTPlayerInstance = {
+  playVideo: () => void;
+  pauseVideo: () => void;
+  loadVideoById: (id: string | { videoId: string }) => void;
+  destroy: () => void;
+  seekTo?: (seconds: number, allowSeekAhead?: boolean) => void;
+  getDuration?: () => number;
+  setSize?: (width: number, height: number) => void;
+};
+
+/** Start around 50% so the hook plays immediately (polls until duration is known). */
+function applyHalfwayStart(player: YTPlayerInstance) {
+  const trySeek = (): boolean => {
+    try {
+      const d = player.getDuration?.();
+      if (typeof d !== 'number' || !Number.isFinite(d) || d <= 0) return false;
+      if (d < 8) {
+        player.playVideo();
+        return true;
+      }
+      const target = Math.min(d * 0.5, Math.max(0, d - 3));
+      player.seekTo?.(target, true);
+      player.playVideo();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (trySeek()) return;
+  let n = 0;
+  const tid = window.setInterval(() => {
+    n += 1;
+    if (trySeek()) {
+      window.clearInterval(tid);
+      return;
+    }
+    if (n > 55) {
+      window.clearInterval(tid);
+      try {
+        player.playVideo();
+      } catch {
+        /* ignore */
+      }
+    }
+  }, 90);
+}
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 const COUNTRY_FETCH_TIMEOUT_MS = 45_000;
@@ -11,7 +60,9 @@ interface ApiTrack {
   name: string;
   artist: string;
   preview_url: string | null;
-  spotify_url: string;
+  /** Present for globe picks (YouTube). */
+  youtube_url?: string;
+  spotify_url?: string;
 }
 
 interface ApiCountryData {
@@ -30,15 +81,16 @@ interface CountryPanelProps {
   isClosing: boolean;
 }
 
-function withAlpha(color: string, alpha: number): string {
-  return color.replace('hsl(', 'hsla(').replace(')', `, ${alpha})`);
-}
-
 const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) => {
   const [loading, setLoading] = useState(true);
   const [data, setData] = useState<ApiCountryData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [playingId, setPlayingId] = useState<string | null>(null);
+  /** Inline YouTube embed is actively playing (vs paused). */
+  const [youtubeIsPlaying, setYoutubeIsPlaying] = useState(false);
+  /** YouTube player row visible (first play expands it; list slides down). */
+  const [youtubeStageOpen, setYoutubeStageOpen] = useState(false);
+  const [youtubeLoadError, setYoutubeLoadError] = useState<string | null>(null);
   const [creatingPlaylist, setCreatingPlaylist] = useState(false);
   const [playlistResult, setPlaylistResult] = useState<{
     url: string;
@@ -47,14 +99,16 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
     error?: string;
   } | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const ytMountRef = useRef<HTMLDivElement | null>(null);
+  const ytWrapperRef = useRef<HTMLDivElement | null>(null);
+  const ytPlayerRef = useRef<YTPlayerInstance | null>(null);
+  const ytEffectGenRef = useRef(0);
 
   const [resolvedCode, setResolvedCode] = useState<string | null>(COUNTRY_NAME_TO_CODE[countryName] || null);
   const code = resolvedCode;
   const meta = code ? COUNTRY_META[code] : undefined;
   const displayName = meta?.displayName || countryName;
   const flag = meta?.flag || '🌍';
-  const vibe = meta?.vibe || 'Eclectic';
-  const vibeColor = meta?.vibeColor || 'hsl(240, 10%, 50%)';
 
   useEffect(() => {
     let cancelled = false;
@@ -92,6 +146,15 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
     setError(null);
     setData(null);
     setPlayingId(null);
+    setYoutubeIsPlaying(false);
+    setYoutubeStageOpen(false);
+    setYoutubeLoadError(null);
+    try {
+      ytPlayerRef.current?.destroy();
+    } catch {
+      /* ignore */
+    }
+    ytPlayerRef.current = null;
     setPlaylistResult(null);
 
     fetch(`${API_BASE}/api/country/${code}`, { signal: ac.signal })
@@ -133,12 +196,29 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
         audioRef.current.pause();
         audioRef.current = null;
       }
+      try {
+        ytPlayerRef.current?.destroy();
+      } catch {
+        /* ignore */
+      }
+      ytPlayerRef.current = null;
     };
+  }, []);
+
+  const pauseYoutube = useCallback(() => {
+    try {
+      ytPlayerRef.current?.pauseVideo();
+    } catch {
+      /* ignore */
+    }
+    setYoutubeIsPlaying(false);
   }, []);
 
   const handlePlay = useCallback(
     (track: ApiTrack) => {
       if (!track.preview_url) return;
+
+      pauseYoutube();
 
       if (playingId === track.id) {
         audioRef.current?.pause();
@@ -154,8 +234,131 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
       audioRef.current = audio;
       setPlayingId(track.id);
     },
-    [playingId],
+    [playingId, pauseYoutube],
   );
+
+  const handleYoutubeToggle = useCallback(
+    (track: ApiTrack) => {
+      if (!track.youtube_url) return;
+      setYoutubeLoadError(null);
+
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+
+      if (playingId === track.id) {
+        if (youtubeIsPlaying) {
+          pauseYoutube();
+        } else {
+          setYoutubeStageOpen(true);
+          try {
+            ytPlayerRef.current?.playVideo();
+          } catch {
+            setYoutubeLoadError('Could not play video.');
+          }
+        }
+        return;
+      }
+
+      setYoutubeStageOpen(true);
+      setPlayingId(track.id);
+      setYoutubeIsPlaying(false);
+    },
+    [playingId, youtubeIsPlaying, pauseYoutube],
+  );
+
+  useEffect(() => {
+    if (!playingId || !data) return;
+    const track = data.tracks.find((t) => t.id === playingId && t.youtube_url);
+    if (!track || !ytMountRef.current) return;
+
+    const gen = ++ytEffectGenRef.current;
+
+    const run = async () => {
+      try {
+        await loadYoutubeIframeApi();
+      } catch {
+        if (gen === ytEffectGenRef.current) setYoutubeLoadError('Could not load YouTube player.');
+        return;
+      }
+      if (gen !== ytEffectGenRef.current || !ytMountRef.current) return;
+
+      const YT = (window as unknown as {
+        YT: { Player: new (el: HTMLElement, opts: Record<string, unknown>) => YTPlayerInstance };
+      }).YT;
+
+      const onStateChange = (e: { data: number }) => {
+        setYoutubeIsPlaying(e.data === YT_STATE_PLAYING);
+      };
+
+      try {
+        const wrap = ytWrapperRef.current;
+        const pw = Math.max(200, Math.floor(wrap?.clientWidth || ytMountRef.current?.clientWidth || 320));
+        const fallbackH = Math.min(Math.floor(window.innerHeight * 0.4), 300);
+        const ph = Math.max(160, Math.floor(wrap?.clientHeight || fallbackH));
+
+        if (ytPlayerRef.current) {
+          ytPlayerRef.current.loadVideoById(track.id);
+          try {
+            ytPlayerRef.current.setSize?.(pw, ph);
+          } catch {
+            /* ignore */
+          }
+          applyHalfwayStart(ytPlayerRef.current);
+        } else {
+          const el = ytMountRef.current;
+          ytPlayerRef.current = new YT.Player(el, {
+            height: ph,
+            width: pw,
+            videoId: track.id,
+            playerVars: {
+              autoplay: 1,
+              playsinline: 1,
+              modestbranding: 1,
+              rel: 0,
+              origin: window.location.origin,
+            },
+            events: {
+              onReady: (ev: { target: YTPlayerInstance }) => {
+                try {
+                  ev.target.setSize?.(pw, ph);
+                } catch {
+                  /* ignore */
+                }
+                applyHalfwayStart(ev.target);
+              },
+              onStateChange,
+            },
+          });
+        }
+      } catch {
+        if (gen === ytEffectGenRef.current) setYoutubeLoadError('Playback failed.');
+      }
+    };
+
+    void run();
+  }, [playingId, data]);
+
+  useEffect(() => {
+    const wrap = ytWrapperRef.current;
+    if (!wrap || !data?.tracks.some((t) => t.youtube_url)) return;
+    const sync = () => {
+      const w = Math.max(160, Math.floor(wrap.clientWidth));
+      const h = Math.max(120, Math.floor(wrap.clientHeight));
+      try {
+        ytPlayerRef.current?.setSize?.(w, h);
+      } catch {
+        /* ignore */
+      }
+    };
+    sync();
+    const ro = new ResizeObserver(() => {
+      window.requestAnimationFrame(sync);
+    });
+    ro.observe(wrap);
+    return () => ro.disconnect();
+  }, [data, code, youtubeStageOpen]);
 
   const handleCreatePlaylist = async () => {
     if (!code) return;
@@ -183,28 +386,15 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
   return (
     <div
       onClick={(e) => e.stopPropagation()}
-      className={`fixed z-40 flex max-h-[min(72vh,560px)] w-full max-w-[380px] flex-col overflow-hidden border-l border-white/[0.06] shadow-2xl bottom-0 right-0 md:top-0 md:bottom-auto md:h-full ${
+      className={`fixed z-40 flex flex-col h-[min(88vh,760px)] w-full max-w-[min(100vw,480px)] overflow-hidden border-l border-white/[0.06] shadow-2xl bottom-0 right-0 md:top-0 md:bottom-auto md:h-full md:max-h-none min-h-0 ${
         isClosing ? 'slide-out-right' : 'slide-in-right'
       }`}
       style={{ background: 'rgba(6,8,20,0.94)', backdropFilter: 'blur(20px)' }}
     >
-      {/* Energy bar at top */}
-      {data && (
-        <div className="h-0.5 w-full shrink-0 overflow-hidden" style={{ background: 'rgba(255,255,255,0.03)' }}>
-          <div
-            className="h-full transition-all duration-1000 ease-out"
-            style={{
-              width: `${Math.round(data.energy * 100)}%`,
-              background: `linear-gradient(90deg, ${vibeColor}, ${withAlpha(vibeColor, 0.4)})`,
-            }}
-          />
-        </div>
-      )}
-
-      <div className="flex flex-1 flex-col gap-5 overflow-y-auto p-5 pt-5">
+      <div className="flex flex-1 flex-col min-h-0 overflow-hidden">
         {/* Header */}
-        <div>
-          <div className="flex items-center justify-between mb-2">
+        <div className="shrink-0 px-5 pt-4 pb-3 border-b border-white/[0.06]">
+          <div className="flex items-center justify-between">
             <div className="flex items-center gap-2.5">
               <span className="text-2xl">{flag}</span>
               <h2 className="retro-title text-base text-foreground tracking-tight">{displayName}</h2>
@@ -217,28 +407,18 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
               <X size={13} className="text-muted-foreground" />
             </button>
           </div>
-          <span
-            className="retro-title inline-flex items-center rounded-sm px-2.5 py-0.5 text-[9px]"
-            style={{
-              backgroundColor: withAlpha(vibeColor, 0.1),
-              color: vibeColor,
-              border: `1px solid ${withAlpha(vibeColor, 0.2)}`,
-            }}
-          >
-            {vibe}
-          </span>
         </div>
 
           {/* Loading state */}
           {loading && (
-            <div className="flex-1 flex items-center justify-center py-12">
+            <div className="flex-1 flex items-center justify-center py-12 px-5">
               <Loader2 className="w-6 h-6 text-muted-foreground animate-spin" />
             </div>
           )}
 
           {/* Error / no data */}
           {error && !loading && (
-            <div className="flex-1 flex flex-col items-center justify-center py-12 gap-3">
+            <div className="flex-1 flex flex-col items-center justify-center py-12 gap-3 px-5">
               <Music className="w-8 h-8 text-muted-foreground/40" />
               <p className="retro-body text-muted-foreground text-center">{error}</p>
               {code && (
@@ -280,21 +460,52 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
             </div>
           )}
 
-          {/* Data content */}
+          {/* Video on top, track list below */}
           {data && !loading && (
-            <>
-              {/* Track list */}
-              <div className="flex flex-col gap-1">
-                <h3 className="retro-title text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
-                  Top Tracks
+            <div className="flex flex-1 min-h-0 flex-col overflow-hidden">
+              {data.tracks.some((t) => t.youtube_url) && (
+                <div
+                  className={`grid shrink-0 w-full bg-black border-white/[0.08] motion-reduce:transition-none transition-[grid-template-rows] duration-500 ease-out ${
+                    youtubeStageOpen ? 'grid-rows-[1fr] border-b' : 'grid-rows-[0fr] border-b-0'
+                  }`}
+                >
+                  <div className="min-h-0 overflow-hidden">
+                    <div
+                      ref={ytWrapperRef}
+                      className="relative w-full min-h-[min(40vh,300px)] h-[min(40vh,300px)]"
+                    >
+                      <div ref={ytMountRef} className="absolute inset-0 w-full h-full" />
+                      {youtubeStageOpen && !playingId && (
+                        <span className="absolute inset-0 flex items-center justify-center retro-body text-[9px] text-muted-foreground/50 pointer-events-none text-center px-4">
+                          Tap a track below — playback starts mid-song
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex flex-col gap-1 min-h-0 flex-1 overflow-y-auto px-5 py-3">
+                <h3 className="retro-title text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1 shrink-0">
+                  Trending on YouTube
                 </h3>
+                {!youtubeStageOpen && data.tracks.some((t) => t.youtube_url) && (
+                  <p className="retro-body text-[9px] text-muted-foreground/60 mb-1 shrink-0">
+                    Tap play on a track — the video opens above and the list moves down.
+                  </p>
+                )}
+                {youtubeLoadError && (
+                  <p className="retro-body text-[10px] text-red-400/90 mb-2 shrink-0">{youtubeLoadError}</p>
+                )}
                 {data.tracks.slice(0, 5).map((track, i) => {
-                  const isPlaying = playingId === track.id;
+                  const isYoutube = Boolean(track.youtube_url);
+                  const isRowActive = playingId === track.id;
+                  const showPause = isYoutube ? isRowActive && youtubeIsPlaying : isRowActive;
                   return (
                     <div
                       key={track.id}
-                      className={`flex items-center gap-3 rounded-lg px-3 py-2.5 transition-colors group ${
-                        isPlaying ? 'bg-white/[0.06]' : 'hover:bg-muted/30'
+                      className={`flex items-center gap-2 rounded-lg px-3 py-2.5 transition-colors group ${
+                        isRowActive ? 'bg-white/[0.06]' : 'hover:bg-muted/30'
                       }`}
                     >
                       <span className="text-xs text-muted-foreground/50 tabular-nums w-4 text-right shrink-0">
@@ -304,88 +515,96 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
                         <p className="retro-body text-foreground truncate">{track.name}</p>
                         <p className="retro-body text-muted-foreground truncate">{track.artist}</p>
                       </div>
-                      {isPlaying && <SoundWave color={vibeColor} />}
-                      {track.preview_url ? (
-                        <button
-                          onClick={() => handlePlay(track)}
-                          className="w-7 h-7 flex items-center justify-center rounded-sm bg-white/[0.06] hover:bg-white/[0.12] transition-colors shrink-0 cursor-pointer border border-white/15"
-                        >
-                          {isPlaying ? (
-                            <Pause size={12} className="text-foreground" />
-                          ) : (
-                            <Play size={12} className="text-foreground ml-0.5" />
-                          )}
-                        </button>
-                      ) : (
-                        <span className="w-7 h-7 shrink-0" />
+                      {isRowActive && (!isYoutube || youtubeIsPlaying) && (
+                        <SoundWave color="hsl(var(--accent))" />
                       )}
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {isYoutube ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handleYoutubeToggle(track)}
+                              aria-label={showPause ? 'Pause' : 'Play in panel'}
+                              className="w-8 h-8 flex items-center justify-center rounded-sm bg-white/[0.06] hover:bg-white/[0.12] transition-colors cursor-pointer border border-white/15"
+                            >
+                              {showPause ? (
+                                <Pause size={13} className="text-foreground" />
+                              ) : (
+                                <Play size={13} className="text-foreground ml-0.5" />
+                              )}
+                            </button>
+                            <a
+                              href={track.youtube_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title="Open on YouTube"
+                              aria-label="Open on YouTube"
+                              className="w-8 h-8 flex items-center justify-center rounded-sm bg-white/[0.06] hover:bg-red-950/45 transition-colors border border-red-500/30 text-red-300"
+                            >
+                              <ExternalLink size={13} />
+                            </a>
+                          </>
+                        ) : track.preview_url ? (
+                          <button
+                            type="button"
+                            onClick={() => handlePlay(track)}
+                            aria-label={isRowActive ? 'Pause preview' : 'Play preview'}
+                            className="w-8 h-8 flex items-center justify-center rounded-sm bg-white/[0.06] hover:bg-white/[0.12] transition-colors shrink-0 cursor-pointer border border-white/15"
+                          >
+                            {isRowActive ? (
+                              <Pause size={13} className="text-foreground" />
+                            ) : (
+                              <Play size={13} className="text-foreground ml-0.5" />
+                            )}
+                          </button>
+                        ) : (
+                          <span className="w-8 h-8 shrink-0" />
+                        )}
+                      </div>
                     </div>
                   );
                 })}
               </div>
-
-              {/* Mood */}
-              <div className="flex flex-col gap-3">
-                <h3 className="retro-title text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Mood</h3>
-                <MoodBar label="Energy" value={Math.round(data.energy * 100)} color="var(--energy)" />
-                <MoodBar label="Danceability" value={Math.round(data.danceability * 100)} color="var(--danceability)" />
-                <MoodBar label="Valence" value={Math.round(data.valence * 100)} color="var(--valence)" />
-              </div>
-            </>
+            </div>
           )}
 
         {/* Action buttons */}
         {data && !loading && (
-          <div className="p-5 pt-0 flex flex-col gap-2">
+          <div className="shrink-0 px-5 py-4 border-t border-white/[0.06] bg-[rgba(6,8,20,0.98)]">
             <button
               onClick={handleCreatePlaylist}
               disabled={creatingPlaylist}
               className="retro-title w-full flex items-center justify-center gap-2 rounded-sm py-3 text-[10px] font-semibold transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-wait"
               style={{
-                backgroundColor: 'hsla(var(--spotify-green) / 0.15)',
-                color: 'hsl(var(--spotify-green))',
-                border: '1px solid hsla(var(--spotify-green) / 0.2)',
+                backgroundColor: 'hsla(var(--youtube-red) / 0.15)',
+                color: 'hsl(var(--youtube-red))',
+                border: '1px solid hsla(var(--youtube-red) / 0.25)',
               }}
             >
               {creatingPlaylist ? <Loader2 size={14} className="animate-spin" /> : <Music size={14} />}
-              {creatingPlaylist ? 'Creating…' : 'Create Playlist'}
+              {creatingPlaylist ? 'Creating…' : 'Create YouTube playlist'}
             </button>
 
             {playlistResult && (
-              <div className="retro-panel mt-1 overflow-hidden border border-white/[0.06] bg-white/[0.03] p-3 flex flex-col gap-2">
+              <div className="retro-panel mt-2 overflow-hidden border border-white/[0.06] bg-white/[0.03] p-3 flex flex-col gap-2">
                 {playlistResult.error ? (
                   <p className="retro-body text-red-400">{playlistResult.error}</p>
                 ) : (
                   <>
-                    <p className="retro-title text-[10px] text-foreground">
-                      {playlistResult.name}
-                    </p>
-                    {playlistResult.tracks.length > 0 && (
-                      <div className="flex flex-col gap-0.5">
-                        {playlistResult.tracks.map((t, i) => (
-                          <p key={i} className="retro-body text-muted-foreground text-sm">{t}</p>
-                        ))}
-                      </div>
-                    )}
+                    <p className="retro-title text-[10px] text-foreground">{playlistResult.name}</p>
                     <a
                       href={playlistResult.url}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="retro-title flex items-center justify-center gap-2 rounded-sm py-2.5 text-[10px] font-semibold transition-colors"
                       style={{
-                        backgroundColor: 'hsla(var(--spotify-green) / 0.15)',
-                        color: 'hsl(var(--spotify-green))',
-                        border: '1px solid hsla(var(--spotify-green) / 0.2)',
+                        backgroundColor: 'hsla(var(--youtube-red) / 0.15)',
+                        color: 'hsl(var(--youtube-red))',
+                        border: '1px solid hsla(var(--youtube-red) / 0.25)',
                       }}
                     >
-                      Open in Spotify
+                      Open in YouTube
                     </a>
-                    <Link
-                      to="/archive"
-                      className="retro-body block text-center text-[10px] text-cyan-400/75 hover:text-cyan-300 hover:underline"
-                    >
-                      View in Archive
-                    </Link>
                   </>
                 )}
               </div>
@@ -404,26 +623,6 @@ function SoundWave({ color }: { color: string }) {
       <span />
       <span />
       <span />
-    </div>
-  );
-}
-
-function MoodBar({ label, value, color }: { label: string; value: number; color: string }) {
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex items-center justify-between">
-        <span className="retro-title text-[10px] text-muted-foreground">{label}</span>
-        <span className="retro-title text-[10px] tabular-nums text-muted-foreground">{value}%</span>
-      </div>
-      <div className="h-1.5 w-full rounded-full bg-muted/50 overflow-hidden">
-        <div
-          className="h-full rounded-full transition-all duration-700 ease-out"
-          style={{
-            width: `${value}%`,
-            backgroundColor: `hsl(${color})`,
-          }}
-        />
-      </div>
     </div>
   );
 }

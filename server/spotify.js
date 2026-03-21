@@ -9,6 +9,22 @@ let tokenExpiry = null;
  */
 let spotifyCooldownUntil = 0;
 
+/** One search at a time — parallel `/v1/search` calls (globe + Crystal + bot) easily trigger 429. */
+let spotifySearchLock = Promise.resolve();
+
+/**
+ * @returns {Promise<() => void>}
+ */
+async function acquireSpotifySearchLock() {
+  const prev = spotifySearchLock;
+  let release;
+  spotifySearchLock = new Promise((resolve) => {
+    release = resolve;
+  });
+  await prev.catch(() => {});
+  return release;
+}
+
 /** Max ms per YouTube row for Spotify matching; then skip (no playlist track for that row). */
 const CRYSTAL_SPOTIFY_LOOKUP_MS = Math.max(
   5000,
@@ -55,44 +71,58 @@ async function withTimeout(promise, ms) {
  * @param {object} config - axios request config (e.g. `{ headers: { Authorization: 'Bearer …' } }`)
  */
 async function spotifyGet(url, config = {}, { maxRetries = 2 } = {}) {
-  if (Date.now() < spotifyCooldownUntil) {
-    const remainMin = Math.ceil((spotifyCooldownUntil - Date.now()) / 60000);
-    const err = new Error(`Spotify API cooldown active (${remainMin} min remaining)`);
-    err.response = { status: 429 };
-    throw err;
-  }
-
-  let attempt = 0;
-  while (true) {
-    try {
-      return await axios.get(url, { timeout: 8000, ...config });
-    } catch (e) {
-      const status = e.response?.status;
-      if (status === 429) {
-        const ra = parseInt(e.response?.headers?.['retry-after'], 10);
-
-        // If Spotify asks us to wait more than 5 minutes, set a global cooldown and stop all requests.
-        if (Number.isFinite(ra) && ra > 300) {
-          spotifyCooldownUntil = Date.now() + ra * 1000;
-          const hrs = (ra / 3600).toFixed(1);
-          console.error(`[Spotify] Hard rate-limit: Retry-After ${ra}s (~${hrs}h). All requests paused until cooldown expires.`);
-          throw e;
-        }
-
-        if (attempt < maxRetries) {
-          const waitMs = Number.isFinite(ra) && ra > 0
-            ? Math.min(ra * 1000, 30000)
-            : Math.min(800 * 2 ** attempt, 16000);
-          console.warn(
-            `[Spotify Web API] 429 rate limit — waiting ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})`,
-          );
-          await sleep(waitMs);
-          attempt += 1;
-          continue;
-        }
-      }
-      throw e;
+  const isSearch = typeof url === 'string' && url.includes('/v1/search');
+  const run = async () => {
+    if (Date.now() < spotifyCooldownUntil) {
+      const remainMin = Math.ceil((spotifyCooldownUntil - Date.now()) / 60000);
+      const err = new Error(`Spotify API cooldown active (${remainMin} min remaining)`);
+      err.response = { status: 429 };
+      throw err;
     }
+
+    let attempt = 0;
+    while (true) {
+      try {
+        return await axios.get(url, { timeout: 8000, ...config });
+      } catch (e) {
+        const status = e.response?.status;
+        if (status === 429) {
+          const ra = parseInt(e.response?.headers?.['retry-after'], 10);
+
+          // If Spotify asks us to wait more than 5 minutes, set a global cooldown and stop all requests.
+          if (Number.isFinite(ra) && ra > 300) {
+            spotifyCooldownUntil = Date.now() + ra * 1000;
+            const hrs = (ra / 3600).toFixed(1);
+            console.error(`[Spotify] Hard rate-limit: Retry-After ${ra}s (~${hrs}h). All requests paused until cooldown expires.`);
+            throw e;
+          }
+
+          if (attempt < maxRetries) {
+            const baseWait =
+              Number.isFinite(ra) && ra > 0
+                ? Math.min(ra * 1000, 45000)
+                : Math.min(1000 * 2 ** attempt, 24000);
+            const jitter = Math.floor(Math.random() * 400);
+            const waitMs = baseWait + jitter;
+            console.warn(
+              `[Spotify Web API] 429 rate limit — waiting ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})`,
+            );
+            await sleep(waitMs);
+            attempt += 1;
+            continue;
+          }
+        }
+        throw e;
+      }
+    }
+  };
+
+  if (!isSearch) return run();
+  const release = await acquireSpotifySearchLock();
+  try {
+    return await run();
+  } finally {
+    release();
   }
 }
 
@@ -223,7 +253,7 @@ async function searchTrackItems(
     {
       headers: { Authorization: `Bearer ${token}` },
     },
-    spotifyGetOptions,
+    { maxRetries: 5, ...spotifyGetOptions },
   );
   let items = data.tracks?.items || [];
   if (filterCompilations) {
@@ -250,8 +280,14 @@ async function searchTracks(
  */
 const BETWEEN_SEARCH_MS = 120;
 
-/** Country panel: allow 429 retries with Retry-After (was maxRetries: 0 → instant failure on any throttle). */
-const SPOTIFY_COUNTRY_SEARCH = { maxRetries: 3 };
+/** Pause before country fallback search so we don’t hammer Search right after a 429. */
+const BETWEEN_COUNTRY_FALLBACK_MS = Math.max(
+  200,
+  parseInt(process.env.SPOTIFY_COUNTRY_GAP_MS || '700', 10) || 700,
+);
+
+/** Country panel: extra retries on top of searchTrackItems default (optional). */
+const SPOTIFY_COUNTRY_SEARCH = { maxRetries: 6 };
 
 /**
  * Globe / country “top tracks”: Spotify Search API only (`api.spotify.com/v1/search`).
@@ -274,23 +310,22 @@ async function getTopTracksForCountry(countryCode) {
   } catch (e) {
     const st = e.response?.status;
     console.warn('[Spotify country] primary failed:', primaryQuery.slice(0, 72), st || e.message);
-    if (st === 429) return [];
+    // Do not return on 429 — after backoff, broad `genre:` often succeeds; early return skipped fallback.
   }
 
   if (tracks.length === 0 && internal !== 'bollywood') {
     try {
-      await sleep(BETWEEN_SEARCH_MS);
+      await sleep(BETWEEN_COUNTRY_FALLBACK_MS);
       tracks = await searchTracks(token, `genre:${tag}`, market, 12, true, SPOTIFY_COUNTRY_SEARCH);
     } catch (e) {
       const st = e.response?.status;
       console.warn('[Spotify country] broad genre failed:', st || e.message);
-      if (st === 429) return [];
     }
   }
 
   if (tracks.length === 0 && internal === 'bollywood') {
     try {
-      await sleep(BETWEEN_SEARCH_MS);
+      await sleep(BETWEEN_COUNTRY_FALLBACK_MS);
       tracks = await searchTracks(token, `hindi year:${y}`, market, 12, true, SPOTIFY_COUNTRY_SEARCH);
     } catch (e) {
       console.warn('[Spotify country] bollywood fallback failed:', e.response?.status || e.message);

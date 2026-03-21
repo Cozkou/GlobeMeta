@@ -48,8 +48,8 @@ function ArchiveCard({ entry }: { entry: ArchiveEntry }) {
       <div className="mb-3 flex items-start justify-between gap-2">
         <CrystalBallIcon variant={variant} className="h-10 w-10 shrink-0 drop-shadow-[0_0_12px_rgba(100,180,255,0.25)]" />
         {entry.playlistUrl && (
-          <span className="retro-title rounded-full border border-[hsl(var(--spotify-green)/0.35)] bg-[hsl(var(--spotify-green)/0.1)] px-2 py-0.5 text-[8px] uppercase tracking-wide text-[hsl(var(--spotify-green))]">
-            Spotify
+          <span className="retro-title rounded-full border border-[hsl(var(--youtube-red)/0.35)] bg-[hsl(var(--youtube-red)/0.12)] px-2 py-0.5 text-[8px] uppercase tracking-wide text-[hsl(var(--youtube-red))]">
+            YouTube
           </span>
         )}
       </div>
@@ -68,7 +68,7 @@ function ArchiveCard({ entry }: { entry: ArchiveEntry }) {
       {!isGlobe && (
         <p className="retro-body mt-2 line-clamp-2 text-left text-[11px] text-muted-foreground">
           {entry.sessionVideosCount} videos
-          {entry.spotifyMatchesCount > 0 ? ` · ${entry.spotifyMatchesCount} on Spotify` : ''}
+          {entry.spotifyMatchesCount > 0 ? ` · ${entry.spotifyMatchesCount} Spotify matches (legacy)` : ''}
         </p>
       )}
       <p className="retro-body mt-3 text-left text-[10px] text-muted-foreground/65">{formatWhen(entry.archivedAt)}</p>
@@ -86,11 +86,11 @@ function ArchiveCard({ entry }: { entry: ArchiveEntry }) {
       )}
       {!entry.playlistUrl && entry.source === 'crystal' && entry.sessionVideosCount > 0 && (
         <p className="retro-body mt-3 border-t border-white/[0.06] pt-3 text-left text-[9px] text-muted-foreground/80">
-          Tap to open Crystal Ball and build a playlist from matches.
+          Tap to open Crystal Ball and build a YouTube playlist from your session.
         </p>
       )}
       <p className="retro-title mt-4 text-center text-[9px] text-cyan-400/50 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
-        {external ? 'Open in Spotify' : 'Open in app'}
+        {external ? 'Open in YouTube' : 'Open in app'}
       </p>
     </>
   );
@@ -156,7 +156,7 @@ const Archive = () => {
         </div>
         <h1 className="retro-title glow-text text-xl tracking-wide text-[rgba(160,196,240,0.9)]">Archive</h1>
         <p className="retro-body mx-auto mt-2 max-w-lg text-[12px] text-muted-foreground">
-          Saved Globe mixes and Crystal Ball sessions. Click a card to open Spotify or jump back into the app.
+          Saved Globe mixes and Crystal Ball sessions. Click a card to open YouTube or jump back into the app.
         </p>
       </div>
 
