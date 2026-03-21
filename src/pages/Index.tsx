@@ -50,7 +50,7 @@ const Index = () => {
     globeRef.current?.flyTo(name);
     setTimeout(() => {
       setIsClosing(false);
-      setSelectedCountry(name);
+      setSelectedCountry({ name, code: null });
     }, 400);
   }, [globeRef, setSelectedCountry]);
 
@@ -140,7 +140,12 @@ const Index = () => {
 
       {selectedCountry && (
         <div className="pointer-events-auto">
-          <CountryPanel countryName={selectedCountry} onClose={handleClose} isClosing={isClosing} />
+          <CountryPanel
+            countryName={selectedCountry.name}
+            countryCodeHint={selectedCountry.code}
+            onClose={handleClose}
+            isClosing={isClosing}
+          />
         </div>
       )}
     </div>

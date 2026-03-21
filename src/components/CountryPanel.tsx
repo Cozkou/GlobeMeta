@@ -55,6 +55,20 @@ function applyHalfwayStart(player: YTPlayerInstance) {
 const API_BASE = import.meta.env.VITE_API_URL || '';
 const COUNTRY_FETCH_TIMEOUT_MS = 45_000;
 
+async function errorMessageFromResponse(res: Response): Promise<string> {
+  const text = await res.text();
+  try {
+    const j = JSON.parse(text) as { error?: unknown; message?: unknown };
+    if (typeof j.error === 'string') return j.error;
+    if (typeof j.message === 'string') return j.message;
+  } catch {
+    /* not JSON */
+  }
+  const snippet = text.replace(/\s+/g, ' ').trim().slice(0, 180);
+  if (snippet) return `Request failed (${res.status}): ${snippet}`;
+  return `Request failed (${res.status} ${res.statusText || 'Error'}). Check VITE_API_URL and that the API server is running.`;
+}
+
 interface ApiTrack {
   id: string;
   name: string;
@@ -77,11 +91,13 @@ interface ApiCountryData {
 
 interface CountryPanelProps {
   countryName: string;
+  /** From globe topojson ISO numeric id → alpha-2; skips fragile name→code lookup when set. */
+  countryCodeHint?: string | null;
   onClose: () => void;
   isClosing: boolean;
 }
 
-const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) => {
+const CountryPanel = ({ countryName, countryCodeHint = null, onClose, isClosing }: CountryPanelProps) => {
   const [loading, setLoading] = useState(true);
   const [data, setData] = useState<ApiCountryData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -112,10 +128,20 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
 
   useEffect(() => {
     let cancelled = false;
+    const hint = countryCodeHint?.trim().toUpperCase() || null;
+    if (hint && /^[A-Z]{2}$/.test(hint)) {
+      setResolvedCode(hint);
+      return () => {
+        cancelled = true;
+      };
+    }
+
     const initialCode = COUNTRY_NAME_TO_CODE[countryName];
     if (initialCode) {
       setResolvedCode(initialCode);
-      return;
+      return () => {
+        cancelled = true;
+      };
     }
 
     setResolvedCode(null);
@@ -129,7 +155,7 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
     return () => {
       cancelled = true;
     };
-  }, [countryName]);
+  }, [countryName, countryCodeHint]);
 
   useEffect(() => {
     if (!code) {
@@ -160,8 +186,7 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
     fetch(`${API_BASE}/api/country/${code}`, { signal: ac.signal })
       .then(async (res) => {
         if (!res.ok) {
-          const json = await res.json().catch(() => ({})) as { error?: string };
-          throw new Error(typeof json.error === 'string' ? json.error : 'not found');
+          throw new Error(await errorMessageFromResponse(res));
         }
         return res.json();
       })
@@ -432,8 +457,7 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
                     fetch(`${API_BASE}/api/country/${code}`, { signal: ac.signal })
                       .then(async (res) => {
                         if (!res.ok) {
-                          const json = await res.json().catch(() => ({})) as { error?: string };
-                          throw new Error(typeof json.error === 'string' ? json.error : 'not found');
+                          throw new Error(await errorMessageFromResponse(res));
                         }
                         return res.json();
                       })

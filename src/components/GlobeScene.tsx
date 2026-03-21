@@ -2,6 +2,7 @@ import { useRef, useEffect, useCallback, useState, useImperativeHandle, forwardR
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { feature } from 'topojson-client';
+import { isoAlpha2FromWorldAtlasId } from '@/data/isoNumericToAlpha2';
 
 const GLOBE_RADIUS = 1;
 const GLOBE_BG = '#0a0a0f';
@@ -99,8 +100,15 @@ function coordsToPoints(coords: number[][], radius: number): THREE.Vector3[] {
   return coords.map(([lng, lat]) => latLngToVec3(lat, lng, radius));
 }
 
+export interface GlobeCountryPick {
+  name: string;
+  /** ISO 3166-1 alpha-2 from world-atlas numeric id; null if unmapped. */
+  code: string | null;
+}
+
 interface CountryMeshData {
   name: string;
+  isoCode: string | null;
   meshes: THREE.Mesh[];
   lines: THREE.Line[];
 }
@@ -111,7 +119,7 @@ export interface GlobeHandle {
 }
 
 interface GlobeProps {
-  onCountryClick: (name: string) => void;
+  onCountryClick: (pick: GlobeCountryPick) => void;
   isPanelOpen: boolean;
   crystalBallMode?: boolean;
 }
@@ -232,7 +240,7 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
         const camDir = s.camera.position.clone().normalize();
         if (surfaceNormal.dot(camDir) < 0.05) return;
         const data = s.countryDataMap.get(hit.object as THREE.Mesh);
-        if (data) onCountryClick(data.name);
+        if (data) onCountryClick({ name: data.name, code: data.isoCode });
       }
     },
     [onCountryClick]
@@ -364,8 +372,9 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
         const featureList = countries.features as any[];
 
         featureList.forEach((feat: any) => {
-          const id = feat.id?.toString();
-          const name = feat.properties?.name || ID_TO_NAME[id] || `Country ${id}`;
+          const id = feat.id != null ? String(feat.id) : '';
+          const isoCode = isoAlpha2FromWorldAtlasId(feat.id);
+          const name = (id && ID_TO_NAME[id]) || feat.properties?.name || (id ? `Country ${id}` : 'Unknown');
           state.countryNames.push(name);
 
           const geom = feat.geometry;
@@ -373,7 +382,7 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
           if (geom.type === 'Polygon') polygons.push(geom.coordinates);
           else if (geom.type === 'MultiPolygon') polygons.push(...geom.coordinates);
 
-          const countryData: CountryMeshData = { name, meshes: [], lines: [] };
+          const countryData: CountryMeshData = { name, isoCode, meshes: [], lines: [] };
 
           const allVerts: number[] = [];
 

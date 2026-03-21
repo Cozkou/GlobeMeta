@@ -1,7 +1,7 @@
 import { useRef, useState, useCallback } from 'react';
 import { NavLink, Outlet, useLocation, Link } from 'react-router-dom';
 import { Home, Globe, Eye, FolderOpen, Disc3 } from 'lucide-react';
-import GlobeScene, { type GlobeHandle } from '@/components/GlobeScene';
+import GlobeScene, { type GlobeHandle, type GlobeCountryPick } from '@/components/GlobeScene';
 import { ArtistRadioPanel } from '@/components/ArtistRadioPanel';
 
 const GLOBE_BG = '#0a0a0f';
@@ -15,9 +15,9 @@ const NAV_TAIL = [{ to: '/archive', label: 'Archive', icon: FolderOpen }] as con
 
 export interface LayoutContext {
   globeRef: React.RefObject<GlobeHandle | null>;
-  onCountryClick: (name: string) => void;
-  selectedCountry: string | null;
-  setSelectedCountry: (name: string | null) => void;
+  onCountryClick: (pick: GlobeCountryPick) => void;
+  selectedCountry: GlobeCountryPick | null;
+  setSelectedCountry: (pick: GlobeCountryPick | null) => void;
   /** Crystal Ball registers this to pause hidden YouTube audio when e.g. Artist shuffle opens. */
   crystalPausePlaybackRef: React.MutableRefObject<(() => void) | null>;
 }
@@ -27,12 +27,12 @@ const AppLayout = () => {
   const crystalBallMode = location.pathname === '/crystal';
   const globeRef = useRef<GlobeHandle | null>(null);
   const crystalPausePlaybackRef = useRef<(() => void) | null>(null);
-  const [selectedCountry, setSelectedCountry] = useState<string | null>(null);
+  const [selectedCountry, setSelectedCountry] = useState<GlobeCountryPick | null>(null);
   const [artistRadioOpen, setArtistRadioOpen] = useState(false);
 
-  const onCountryClick = useCallback((name: string) => {
+  const onCountryClick = useCallback((pick: GlobeCountryPick) => {
     if (crystalBallMode) return;
-    setSelectedCountry((prev) => (prev === name ? null : name));
+    setSelectedCountry((prev) => (prev?.name === pick.name ? null : pick));
   }, [crystalBallMode]);
 
   const ctx: LayoutContext = {
