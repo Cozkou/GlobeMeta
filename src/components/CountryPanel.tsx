@@ -94,8 +94,11 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
     setPlaylistResult(null);
 
     fetch(`${API_BASE}/api/country/${code}`, { signal: ac.signal })
-      .then(res => {
-        if (!res.ok) throw new Error('not found');
+      .then(async (res) => {
+        if (!res.ok) {
+          const json = await res.json().catch(() => ({})) as { error?: string };
+          throw new Error(typeof json.error === 'string' ? json.error : 'not found');
+        }
         return res.json();
       })
       .then(d => {
@@ -104,11 +107,12 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
       .catch((err: unknown) => {
         if (cancelled) return;
         const aborted = err instanceof DOMException && err.name === 'AbortError';
-        setError(
-          aborted
-            ? 'Request timed out — check that the API server is running and try again.'
-            : 'No music data available for this country yet.',
-        );
+        if (aborted) {
+          setError('Request timed out — check that the API server is running and try again.');
+        } else {
+          const msg = err instanceof Error ? err.message : '';
+          setError(msg || 'No music data available for this country yet.');
+        }
       })
       .finally(() => {
         clearTimeout(t);
@@ -247,6 +251,42 @@ const CountryPanel = ({ countryName, onClose, isClosing }: CountryPanelProps) =>
             <div className="flex-1 flex flex-col items-center justify-center py-12 gap-3">
               <Music className="w-8 h-8 text-muted-foreground/40" />
               <p className="retro-body text-muted-foreground text-center">{error}</p>
+              {code && (
+                <button
+                  onClick={() => {
+                    setError(null);
+                    setLoading(true);
+                    setData(null);
+                    const ac = new AbortController();
+                    const t = window.setTimeout(() => ac.abort(), COUNTRY_FETCH_TIMEOUT_MS);
+                    fetch(`${API_BASE}/api/country/${code}`, { signal: ac.signal })
+                      .then(async (res) => {
+                        if (!res.ok) {
+                          const json = await res.json().catch(() => ({})) as { error?: string };
+                          throw new Error(typeof json.error === 'string' ? json.error : 'not found');
+                        }
+                        return res.json();
+                      })
+                      .then((d) => setData(d))
+                      .catch((err: unknown) => {
+                        const aborted = err instanceof DOMException && err.name === 'AbortError';
+                        if (aborted) {
+                          setError('Request timed out — check that the API server is running and try again.');
+                        } else {
+                          const msg = err instanceof Error ? err.message : '';
+                          setError(msg || 'No music data available for this country yet.');
+                        }
+                      })
+                      .finally(() => {
+                        clearTimeout(t);
+                        setLoading(false);
+                      });
+                  }}
+                  className="retro-title text-[10px] text-accent/80 hover:text-accent underline underline-offset-2"
+                >
+                  Try again
+                </button>
+              )}
             </div>
           )}
 

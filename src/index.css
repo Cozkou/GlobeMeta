@@ -177,4 +177,5 @@
     from { opacity: 0.16; transform: translateY(0); }
     to { opacity: 0.32; transform: translateY(-4px); }
   }
+
 }

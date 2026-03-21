@@ -11,6 +11,7 @@ const {
   COUNTRY_GENRES,
   resolveCrystalSessionVideosToSpotify,
   iterateCrystalSpotifyMatches,
+  getSpotifyCooldownRemaining,
 } = require('./spotify');
 const { parseUserIntent, generatePlaylistDetails, generateReply, analyzeVibe, generateYouTubeSearchQuery, generateCrystalSessionPlaylistDetails } = require('./agent');
 
@@ -28,7 +29,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// In-memory data store
+/**
+ * In-memory cache for `/api/country` and `/api/create-playlist` (globe).
+ * Populated only via Spotify Web API (`getTopTracksForCountry` in spotify.js).
+ * Does not use YouTube — YOUTUBE_* keys are for Crystal Ball routes only.
+ */
 let globeData = {};
 
 const regionNames = new Intl.DisplayNames(['en'], { type: 'region' });
@@ -44,6 +49,7 @@ const GENRE_MOOD = {
   'bollywood':  { energy: 0.75, danceability: 0.82, valence: 0.76 },
 };
 
+/** Fetches top tracks from Spotify Search API for the given market; never calls YouTube. */
 async function refreshCountryData(countryCode) {
   try {
     const code = countryCode.toUpperCase();
@@ -70,6 +76,18 @@ async function refreshCountryData(countryCode) {
   }
 }
 
+app.get('/api/spotify-status', (req, res) => {
+  const cooldownMs = getSpotifyCooldownRemaining();
+  res.json({
+    ok: cooldownMs === 0,
+    cooldownMs,
+    cooldownMinutes: Math.ceil(cooldownMs / 60000),
+    message: cooldownMs > 0
+      ? `Spotify rate-limited — cooldown expires in ~${Math.ceil(cooldownMs / 60000)} minutes`
+      : 'Spotify API available',
+  });
+});
+
 // API endpoint for the globe frontend
 app.get('/api/globe-data', (req, res) => {
   res.json(globeData);
@@ -81,12 +99,25 @@ app.get('/api/country/:code', async (req, res) => {
   const maxAgeMs = 60 * 60 * 1000;
   const isFresh = cached && (Date.now() - new Date(cached.updatedAt).getTime() < maxAgeMs);
 
+  let servedStale = false;
   if (!isFresh) {
-    await refreshCountryData(code);
+    try {
+      await Promise.race([
+        refreshCountryData(code),
+        // Allow Spotify 429 Retry-After + retries (see spotify.js spotifyGet).
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 45000)),
+      ]);
+    } catch (err) {
+      console.warn('refreshCountryData timed out or failed for', code, err.message);
+      if (globeData[code]) servedStale = true;
+    }
   }
 
   const data = globeData[code];
-  if (!data) return res.status(404).json({ error: 'Country not found' });
+  if (!data) {
+    return res.status(404).json({ error: 'Country not found — Spotify may be rate-limiting. Try again in a moment.' });
+  }
+  if (servedStale) res.setHeader('X-Country-Data-Stale', '1');
   res.json(data);
 });
 
@@ -101,6 +132,8 @@ app.post('/api/vibe-analyze', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// --- YouTube Data API (Crystal Ball: /api/youtube-*, browser playback). Not used for globe/country. ---
 
 function isLyricVideo(item) {
   const title = (item.snippet?.title || '').toLowerCase();
@@ -435,8 +468,122 @@ const PUBLIC_APP_URL = (process.env.PUBLIC_APP_URL || 'https://globe-meta.vercel
  * @param {string|null} fallbackCountryCode - optional 2-letter code when the model omits country (unused by Luffa)
  * @returns {{ text: string }}
  */
+function luffaFallbackReply(messageText) {
+  const t = (messageText || '').trim().toLowerCase();
+  if (/^(hi|hello|hey|sup|yo)\b|^hii\b/.test(t)) {
+    return `Hi! I'm Pulse Earth Vibes — I help you discover music from around the world. Try "What's trending in Japan?" or open ${PUBLIC_APP_URL}/globe 🌍`;
+  }
+  return `I'm Pulse Earth Vibes. Ask for trending tracks or a playlist from any country (e.g. Brazil, Japan), or visit ${PUBLIC_APP_URL}/globe`;
+}
+
+/** Short pure greetings — answer immediately without Claude (avoids slow parallel bursts). */
+function isQuickGreetingOnly(text) {
+  const t = (text || '').trim();
+  if (t.length === 0 || t.length > 32) return false;
+  const lower = t.toLowerCase();
+  if (['hi', 'hey', 'hello', 'sup', 'yo', 'hii', 'hi!', 'hey!', 'hello!'].includes(lower)) return true;
+  return /^(hi|hello|hey|sup|yo|hii)[!.\s]*$/i.test(t);
+}
+
+/**
+ * If Claude’s JSON misses country/intent, map “top tracks in USA”-style text to get_trending + ISO code.
+ * Order: longer phrases first (e.g. United States before US).
+ */
+const COUNTRY_PHRASE_TO_ISO = [
+  [/united\s+states|u\.s\.a\.?|(?<![a-z])usa(?![a-z])/i, 'US', 'United States'],
+  [/\bamerica\b/i, 'US', 'United States'],
+  [/united\s+kingdom|u\.k\.|britain|(?<![a-z])uk(?![a-z])|england|scotland|wales/i, 'GB', 'United Kingdom'],
+  [/north\s+korea/i, 'KP', 'North Korea'],
+  [/south\s+korea/i, 'KR', 'South Korea'],
+  [/(?<![a-z])korea(?![a-z])/i, 'KR', 'South Korea'],
+  [/\bjapan\b/i, 'JP', 'Japan'],
+  [/\bbrazil\b/i, 'BR', 'Brazil'],
+  [/\bmexico\b/i, 'MX', 'Mexico'],
+  [/\bcanada\b/i, 'CA', 'Canada'],
+  [/\baustralia\b/i, 'AU', 'Australia'],
+  [/\bindia\b/i, 'IN', 'India'],
+  [/\bfrance\b/i, 'FR', 'France'],
+  [/\bgermany\b/i, 'DE', 'Germany'],
+  [/\bspain\b/i, 'ES', 'Spain'],
+  [/\bitaly\b/i, 'IT', 'Italy'],
+  [/\bnetherlands\b|\bholland\b/i, 'NL', 'Netherlands'],
+  [/\bchina\b/i, 'CN', 'China'],
+  [/\bindonesia\b/i, 'ID', 'Indonesia'],
+  [/\bthailand\b/i, 'TH', 'Thailand'],
+  [/\bvietnam\b/i, 'VN', 'Vietnam'],
+  [/\bphilippines\b/i, 'PH', 'Philippines'],
+  [/\bargentina\b/i, 'AR', 'Argentina'],
+  [/\bcolombia\b/i, 'CO', 'Colombia'],
+  [/\bnigeria\b/i, 'NG', 'Nigeria'],
+  [/\bsouth\s+africa\b/i, 'ZA', 'South Africa'],
+  [/\begypt\b/i, 'EG', 'Egypt'],
+  [/\bturkey\b/i, 'TR', 'Turkey'],
+  [/\bsweden\b/i, 'SE', 'Sweden'],
+  [/\bnorway\b/i, 'NO', 'Norway'],
+  [/\bpoland\b/i, 'PL', 'Poland'],
+  [/\bukraine\b/i, 'UA', 'Ukraine'],
+  [/\brussia\b/i, 'RU', 'Russia'],
+];
+
+const TRENDING_REQUEST_RE =
+  /\b(top\s+tracks?|trending|what'?s\s+(hot|trending)|charts?|chart\s+hits|popular\s+(songs?|tracks?)|hits\s+in|hot\s+tracks?|give\s+me\s+(the\s+)?(top|hot)\b)/i;
+
+function matchCountryCodeFromText(t) {
+  for (const [re, code, name] of COUNTRY_PHRASE_TO_ISO) {
+    if (re.test(t)) return { code, name };
+  }
+  return null;
+}
+
+/** @returns {{ intent: string, countryCode: string, country: string, mood: null } | null} */
+function inferTrendingIntentFromText(raw) {
+  const t = (raw || '').trim();
+  if (t.length < 6) return null;
+  if (!TRENDING_REQUEST_RE.test(t) && !/\b(trending|top\s+tracks?|charts?)\b/i.test(t)) return null;
+  const c = matchCountryCodeFromText(t);
+  if (!c) return null;
+  return {
+    intent: 'get_trending',
+    countryCode: c.code,
+    country: c.name,
+    mood: null,
+  };
+}
+
 async function processMusicBotMessage(messageText, fallbackCountryCode = null) {
-  const intent = await parseUserIntent(messageText);
+  if (!process.env.CLAUDE_API_KEY) {
+    return { text: luffaFallbackReply(messageText) };
+  }
+
+  if (isQuickGreetingOnly(messageText)) {
+    return { text: luffaFallbackReply(messageText) };
+  }
+
+  let intent;
+  try {
+    intent = await parseUserIntent(messageText);
+  } catch (e) {
+    console.warn('parseUserIntent failed:', e.message);
+    return { text: luffaFallbackReply(messageText) };
+  }
+
+  const heuristic = inferTrendingIntentFromText(messageText);
+  if (heuristic) {
+    if (intent.intent === 'unknown') {
+      intent = { ...intent, ...heuristic };
+    } else if (
+      ['get_trending', 'get_vibe', 'create_playlist'].includes(intent.intent) &&
+      !intent.countryCode &&
+      heuristic.countryCode
+    ) {
+      intent = {
+        ...intent,
+        countryCode: heuristic.countryCode,
+        country: intent.country || heuristic.country,
+      };
+    }
+  }
+
   const code = (intent.countryCode || fallbackCountryCode || '').toUpperCase() || null;
 
   if ((intent.intent === 'create_playlist' || intent.intent === 'get_trending' || intent.intent === 'get_vibe') && code) {
@@ -468,26 +615,70 @@ async function processMusicBotMessage(messageText, fallbackCountryCode = null) {
     };
   }
 
-  // Fallback: reply based on whatever the user asked (conversational)
   let countryData = null;
   if (code) {
     if (!globeData[code]) await refreshCountryData(code);
     countryData = globeData[code];
   }
-  const reply = await generateReply(messageText, { countryData, countryCode: code });
-  return { text: reply };
+  try {
+    const reply = await generateReply(messageText, { countryData, countryCode: code });
+    return { text: reply };
+  } catch (e) {
+    console.warn('generateReply failed:', e.message);
+    return { text: luffaFallbackReply(messageText) };
+  }
 }
 
 // Luffa uses polling, not webhooks. Poll receive API every second.
 const LUFFA_RECEIVE_URL = 'https://apibot.luffa.im/robot/receive';
 const LUFFA_SEND_URL = 'https://apibot.luffa.im/robot/send';
 const LUFFA_SEND_GROUP_URL = 'https://apibot.luffa.im/robot/sendGroup';
-const LUFFA_POLL_INTERVAL_MS = 1000;
+/** Luffa often returns [] until a message is ready — slightly faster default picks up traffic sooner (set LUFFA_POLL_MS 250–3000). */
+const LUFFA_POLL_INTERVAL_MS = Math.min(3000, Math.max(250, parseInt(process.env.LUFFA_POLL_MS || '700', 10) || 700));
 const LUFFA_MSGID_DEDUPE_MAX = 500;
 
 const seenMsgIds = new Set();
 const msgIdQueue = [];
 let luffaLastNetworkErrorLog = 0;
+/** Throttle “still polling” lines so the console isn’t silent, without logging every 1s. */
+let luffaLastHeartbeatLog = 0;
+const LUFFA_HEARTBEAT_MS = 15000;
+
+/** Process Luffa DMs one at a time so Claude/Spotify work isn’t parallel-bursts (which felt “frozen then all replies at once”). */
+const luffaReplyQueue = [];
+let luffaReplyWorkerRunning = false;
+
+function enqueueLuffaReply(uid, text, isGroup) {
+  luffaReplyQueue.push({ uid, text, isGroup });
+  void runLuffaReplyWorker();
+}
+
+async function runLuffaReplyWorker() {
+  if (luffaReplyWorkerRunning) return;
+  luffaReplyWorkerRunning = true;
+  try {
+    while (luffaReplyQueue.length > 0) {
+      const job = luffaReplyQueue.shift();
+      if (!job) break;
+      const { uid, text, isGroup } = job;
+      try {
+        const { text: reply } = await processMusicBotMessage(text, null);
+        await sendLuffaMessage(uid, reply, isGroup);
+        console.log(`[Luffa] ${new Date().toISOString()} reply sent → uid=${uid}${isGroup ? ' (group)' : ''}`);
+      } catch (err) {
+        console.error('Luffa process error:', err.message);
+        try {
+          await sendLuffaMessage(uid, 'Something went wrong. Try again in a moment.', isGroup);
+        } catch (sendErr) {
+          console.error('Luffa: failed to send error reply:', sendErr.message);
+        }
+      }
+    }
+  } finally {
+    luffaReplyWorkerRunning = false;
+    if (luffaReplyQueue.length > 0) void runLuffaReplyWorker();
+  }
+}
 
 function markMsgIdSeen(msgId) {
   if (!msgId || seenMsgIds.has(msgId)) return true;
@@ -530,6 +721,52 @@ async function sendLuffaMessage(uid, text, isGroup = false) {
   }
 }
 
+/** Aligns with luffa-bot-python-sdk: double-encoded JSON, plain strings, alternate text keys. */
+function coerceLuffaMessageToObject(raw) {
+  if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') {
+    let s = raw.trim();
+    for (let i = 0; i < 2; i += 1) {
+      try {
+        const obj = JSON.parse(s);
+        if (obj !== null && typeof obj === 'object' && !Array.isArray(obj)) return obj;
+        if (Array.isArray(obj) && obj[0] && typeof obj[0] === 'object') return obj[0];
+        if (typeof obj === 'string') {
+          s = obj;
+          continue;
+        }
+        break;
+      } catch {
+        break;
+      }
+    }
+    if (s.length > 0) return { text: s };
+  }
+  return null;
+}
+
+function extractLuffaMessageText(obj) {
+  if (!obj || typeof obj !== 'object') return '';
+  if (typeof obj.text === 'string' && obj.text.trim()) return obj.text.trim();
+  for (const key of ['msg', 'content', 'message']) {
+    const v = obj[key];
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  if (typeof obj.urlLink === 'string' && obj.urlLink.trim()) return obj.urlLink.trim();
+  return '';
+}
+
+function luffaDedupeId(obj) {
+  const keys = ['msgId', 'msgid', 'mid', 'message_id', 'id'];
+  for (const k of keys) {
+    const v = obj[k];
+    if (v !== undefined && v !== null && String(v).trim()) {
+      return `luffa:${String(v)}`;
+    }
+  }
+  return `luffa:sha1:${crypto.createHash('sha1').update(JSON.stringify(obj)).digest('hex')}`;
+}
+
 async function pollLuffa() {
   const secret = process.env.LUFFA_BOT_SECRET;
   if (!secret) return;
@@ -540,46 +777,70 @@ async function pollLuffa() {
       timeout: 5000,
     });
     let data = res.data;
+    if (data && typeof data === 'object' && !Array.isArray(data) && Object.prototype.hasOwnProperty.call(data, 'data')) {
+      data = data.data;
+    }
     if (!Array.isArray(data) && data && (data.data || data.message)) {
       data = data.data || data.message;
     }
 
     if (!Array.isArray(data)) {
-      if (data && Object.keys(data).length > 0) {
+      if (data && typeof data === 'object' && Object.keys(data).length > 0) {
         console.log('Luffa receive (unexpected shape):', JSON.stringify(data).slice(0, 400));
       }
       return;
     }
 
+    const envCount = data.length;
+    let rawSlotCount = 0;
+    for (const env of data) {
+      const ml = env && (env.message ?? env.messages);
+      if (Array.isArray(ml)) rawSlotCount += ml.length;
+    }
+
+    const debugPoll = process.env.LUFFA_DEBUG === '1';
+    const now = Date.now();
+    if (debugPoll) {
+      console.log(
+        `Luffa: poll OK — HTTP ${res.status}, ${envCount} envelope(s), ${rawSlotCount} message slot(s)`,
+      );
+    } else if (envCount > 0 || rawSlotCount > 0) {
+      console.log(
+        `Luffa: message received — ${envCount} envelope(s), ${rawSlotCount} raw message slot(s)`,
+      );
+    } else if (now - luffaLastHeartbeatLog >= LUFFA_HEARTBEAT_MS) {
+      luffaLastHeartbeatLog = now;
+      console.log(
+        `[Luffa] idle — last /receive had 0 envelopes (normal: Luffa queues server-side; your DM may show on the next non-empty poll). LUFFA_DEBUG=1 logs every poll.`,
+      );
+    }
+
     for (const envelope of data) {
-      const { uid, message: msgList, type } = envelope;
+      if (!envelope || typeof envelope !== 'object') continue;
+      const uid = envelope.uid;
+      const msgList = envelope.message ?? envelope.messages;
       if (!uid || !Array.isArray(msgList)) continue;
 
-      const isGroup = String(type) === '1';
+      const isGroup = String(envelope.type) === '1';
 
       for (const raw of msgList) {
-        let parsed;
-        try {
-          parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-        } catch {
+        const parsed = coerceLuffaMessageToObject(raw);
+        if (!parsed) continue;
+        const text = extractLuffaMessageText(parsed);
+        if (!text) continue;
+        const dedupeId = luffaDedupeId(parsed);
+        if (markMsgIdSeen(dedupeId)) {
+          if (process.env.LUFFA_DEBUG === '1') {
+            console.log('[Luffa] skip duplicate (already handled):', dedupeId.slice(0, 48));
+          }
           continue;
         }
-        const text = (parsed?.text || '').trim();
-        const msgId = parsed?.msgId;
-        if (!text) continue;
-        if (msgId && markMsgIdSeen(msgId)) continue;
 
-        console.log('Luffa: processing message from', uid, ':', text.slice(0, 50));
-        (async () => {
-          try {
-            const { text: reply } = await processMusicBotMessage(text, null);
-            await sendLuffaMessage(uid, reply, isGroup);
-            console.log('Luffa: replied to', uid);
-          } catch (err) {
-            console.error('Luffa process error:', err.message);
-            await sendLuffaMessage(uid, 'Something went wrong. Try again in a moment.', isGroup);
-          }
-        })();
+        const preview = text.length > 90 ? `${text.slice(0, 90)}…` : text;
+        console.log(
+          `[Luffa] ${new Date().toISOString()} inbox ← uid=${uid}${isGroup ? ' group' : ''} | ${preview}`,
+        );
+        enqueueLuffaReply(uid, text, isGroup);
       }
     }
   } catch (err) {
@@ -601,7 +862,12 @@ function startLuffaPoller() {
     console.log('Luffa: LUFFA_BOT_SECRET not set, bot polling disabled');
     return;
   }
-  console.log('Luffa: polling started (receive every 1s)');
+  if (!process.env.CLAUDE_API_KEY) {
+    console.warn('Luffa: CLAUDE_API_KEY not set — bot uses short text fallbacks (add to server/.env for full AI replies)');
+  }
+  console.log(
+    `Luffa: polling every ${LUFFA_POLL_INTERVAL_MS}ms — IN/reply lines use ISO timestamps; ~15s idle heartbeat when queue empty.`,
+  );
   setInterval(pollLuffa, LUFFA_POLL_INTERVAL_MS);
   pollLuffa();
 }

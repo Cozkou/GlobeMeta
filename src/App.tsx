@@ -6,7 +6,9 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import Home from "./pages/Home.tsx";
 import Index from "./pages/Index.tsx";
 import Crystal from "./pages/Crystal.tsx";
+import Archive from "./pages/Archive.tsx";
 import NotFound from "./pages/NotFound.tsx";
+import AppLayout from "./components/AppLayout.tsx";
 
 const queryClient = new QueryClient();
 
@@ -18,9 +20,11 @@ const App = () => (
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<Home />} />
-          <Route path="/globe" element={<Index />} />
-          <Route path="/crystal" element={<Crystal />} />
-          {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
+          <Route element={<AppLayout />}>
+            <Route path="/globe" element={<Index />} />
+            <Route path="/crystal" element={<Crystal />} />
+            <Route path="/archive" element={<Archive />} />
+          </Route>
           <Route path="*" element={<NotFound />} />
         </Routes>
       </BrowserRouter>

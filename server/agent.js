@@ -8,11 +8,21 @@ async function parseUserIntent(message) {
     max_tokens: 1000,
     messages: [{
       role: 'user',
-      content: `Extract the intent from this message sent to a music bot. 
+      content: `Extract the intent from this message sent to a music bot (Pulse Earth Vibes). The backend has Spotify top tracks per country — use get_trending when the user wants charts, trending, hot tracks, or "top tracks" for a country.
       Return ONLY valid JSON with no extra text.
-      
+
+      Examples:
+      Message: "give me top tracks in the USA"
+      {"intent":"get_trending","country":"United States","countryCode":"US","mood":null}
+      Message: "what's trending in Japan right now"
+      {"intent":"get_trending","country":"Japan","countryCode":"JP","mood":null}
+      Message: "make a playlist from Brazil"
+      {"intent":"create_playlist","country":"Brazil","countryCode":"BR","mood":null}
+      Message: "what's the vibe in France"
+      {"intent":"get_vibe","country":"France","countryCode":"FR","mood":null}
+
       Message: "${message}"
-      
+
       Return format:
       {
         "intent": "create_playlist" | "get_trending" | "get_vibe" | "unknown",
@@ -69,7 +79,7 @@ async function generatePlaylistDetails(country, tracks) {
  */
 async function generateReply(userMessage, context = {}) {
   const { countryData, countryCode } = context;
-  let contextBlock = 'You are Pulse Earth Vibes, a friendly music bot. You help people discover trending music from around the world via Spotify. You can create playlists, list trending tracks, and describe the vibe (energy, danceability, valence) for any country.';
+  let contextBlock = 'You are Pulse Earth Vibes, a friendly music bot. You help people discover trending music from around the world via Spotify. You can create playlists, list trending tracks, and describe the vibe (energy, danceability, valence) for any country. Do NOT say you lack access to Spotify, charts, or "real-time" data — if the user names a country, the app can fetch that country\'s trending tracks; encourage clear country + "trending" or "top tracks" phrasing instead of refusing.';
   if (countryData) {
     const tracks = countryData.tracks.slice(0, 5).map((t, i) => `${i + 1}. ${t.name} — ${t.artist}`).join('\n');
     contextBlock += `\n\nCurrent context: User asked about ${countryData.country}. Top tracks: ${tracks}. Energy ${Math.round(countryData.energy * 100)}%, Danceability ${Math.round(countryData.danceability * 100)}%, Valence ${Math.round(countryData.valence * 100)}%.`;

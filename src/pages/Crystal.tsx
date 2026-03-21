@@ -1,12 +1,149 @@
-import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
-import * as THREE from 'three';
+import { useRef, useEffect, useState, useCallback, useMemo, type CSSProperties } from 'react';
 import * as faceapi from '@vladmandic/face-api';
-import { useNavigate } from 'react-router-dom';
-import { Video, VideoOff, Loader2, Music, Archive } from 'lucide-react';
+import { Loader2, Music, Archive } from 'lucide-react';
+
+/** Circular RGB audio-wave visualizer drawn on a <canvas> right at the crystal ball edge. */
+function CircularWaveCanvas({ playing }: { playing: boolean }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const barsRef = useRef<number[]>([]);
+  const velRef = useRef<number[]>([]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const BAR_COUNT = 120;
+    if (barsRef.current.length !== BAR_COUNT) {
+      barsRef.current = Array.from({ length: BAR_COUNT }, () => 0);
+      velRef.current = Array.from({ length: BAR_COUNT }, () => 0);
+    }
+    const bars = barsRef.current;
+    const vel = velRef.current;
+    let raf = 0;
+    let frame = 0;
+
+    const hslForAngle = (angle: number): string => {
+      const t = ((angle / (Math.PI * 2)) + 1) % 1;
+      const m = t <= 0.5 ? t * 2 : (1 - t) * 2;
+      const hue = 270 + m * 210;
+      return `hsl(${hue % 360}, 100%, 58%)`;
+    };
+
+    const draw = () => {
+      const { width, height } = canvas;
+      const cx = width / 2;
+      const cy = height / 2;
+      const ballRadius = Math.min(cx, cy) * 0.28;
+      const maxBarLen = ballRadius * 0.35;
+
+      ctx.clearRect(0, 0, width, height);
+
+      if (!playing) {
+        // Decay all bars to 0 when not playing
+        for (let i = 0; i < BAR_COUNT; i++) {
+          bars[i] *= 0.9;
+          vel[i] *= 0.8;
+        }
+        if (bars.some(b => b > 0.01)) {
+          // Still decaying — keep drawing
+        } else {
+          raf = requestAnimationFrame(draw);
+          return;
+        }
+      } else {
+        frame++;
+        // Random impulsive spikes — several bars get kicked each frame
+        const spikeCount = Math.random() < 0.3 ? Math.floor(3 + Math.random() * 8) : Math.floor(Math.random() * 3);
+        for (let s = 0; s < spikeCount; s++) {
+          const idx = Math.floor(Math.random() * BAR_COUNT);
+          const strength = 0.5 + Math.random() * 0.5;
+          vel[idx] = Math.max(vel[idx], strength);
+          // Bleed into neighbors for organic look
+          if (idx > 0) vel[idx - 1] = Math.max(vel[idx - 1], strength * 0.5);
+          if (idx < BAR_COUNT - 1) vel[idx + 1] = Math.max(vel[idx + 1], strength * 0.5);
+        }
+
+        // Occasional big burst — hits a cluster of bars hard
+        if (Math.random() < 0.06) {
+          const center = Math.floor(Math.random() * BAR_COUNT);
+          const spread = 4 + Math.floor(Math.random() * 10);
+          for (let j = -spread; j <= spread; j++) {
+            const idx = (center + j + BAR_COUNT) % BAR_COUNT;
+            const falloff = 1 - Math.abs(j) / (spread + 1);
+            vel[idx] = Math.max(vel[idx], (0.7 + Math.random() * 0.3) * falloff);
+          }
+        }
+
+        for (let i = 0; i < BAR_COUNT; i++) {
+          bars[i] += vel[i] * 0.6;
+          bars[i] = Math.min(bars[i], 1);
+          // Fast decay — bars drop quickly so spikes are sharp
+          vel[i] *= 0.7;
+          bars[i] *= 0.88;
+        }
+      }
+
+      const barWidth = Math.max(2, (Math.PI * 2 * ballRadius) / BAR_COUNT * 0.5);
+
+      for (let i = 0; i < BAR_COUNT; i++) {
+        if (bars[i] < 0.01) continue;
+        const h = bars[i] * maxBarLen;
+        const angle = (i / BAR_COUNT) * Math.PI * 2 - Math.PI / 2;
+        const cos = Math.cos(angle);
+        const sin = Math.sin(angle);
+
+        const x1 = cx + cos * (ballRadius + 2);
+        const y1 = cy + sin * (ballRadius + 2);
+        const x2 = cx + cos * (ballRadius + 2 + h);
+        const y2 = cy + sin * (ballRadius + 2 + h);
+
+        const color = hslForAngle(angle);
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = barWidth;
+        ctx.lineCap = 'round';
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 8;
+        ctx.stroke();
+      }
+      ctx.shadowBlur = 0;
+
+      raf = requestAnimationFrame(draw);
+    };
+
+    const resize = () => {
+      const parent = canvas.parentElement;
+      if (!parent) return;
+      const dpr = Math.min(2, window.devicePixelRatio);
+      canvas.width = parent.clientWidth * dpr;
+      canvas.height = parent.clientHeight * dpr;
+      canvas.style.width = parent.clientWidth + 'px';
+      canvas.style.height = parent.clientHeight + 'px';
+    };
+    resize();
+    window.addEventListener('resize', resize);
+    raf = requestAnimationFrame(draw);
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', resize);
+    };
+  }, [playing]);
+
+  const style: CSSProperties = {
+    position: 'absolute',
+    inset: 0,
+    pointerEvents: 'none',
+  };
+
+  return <canvas ref={canvasRef} style={style} />;
+}
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
-const GLOBE_BG = '#0a0a0f';
-const TRANSITION_DURATION_MS = 4000;
 /** Min time between auto–music changes from mood shifts */
 const HAPPINESS_DEBOUNCE_MS = 14_000;
 /** Smoothed happiness must move this much (0–1) before a new track fetch */
@@ -44,11 +181,11 @@ const YT_START_SECONDS = 0;
 
 function youtubePlayerVars(): Record<string, number | string> {
   if (typeof window === 'undefined') {
-    return { autoplay: 0, controls: 1, rel: 0, modestbranding: 1, playsinline: 1 };
+    return { autoplay: 1, controls: 0, rel: 0, modestbranding: 1, playsinline: 1 };
   }
   return {
-    autoplay: 0,
-    controls: 1,
+    autoplay: 1,
+    controls: 0,
     rel: 0,
     modestbranding: 1,
     playsinline: 1,
@@ -126,6 +263,14 @@ function CrystalYouTubeDualStage({
           height: '100%',
           playerVars: youtubePlayerVars(),
           events: {
+            onReady: (e: { target: YTPlayerApi }) => {
+              if (slot === activeSlotRef.current) {
+                try { e.target.playVideo(); } catch { /* */ }
+                setTimeout(() => {
+                  try { e.target.unMute(); e.target.setVolume(100); e.target.playVideo(); } catch { /* */ }
+                }, 300);
+              }
+            },
             onStateChange: (e) => {
               if (e.data !== 0) return;
               if (slot !== activeSlotRef.current) return;
@@ -201,40 +346,14 @@ function CrystalYouTubeDualStage({
     try {
       pB.pauseVideo();
       pB.mute();
-      // Muted load + play first avoids many browsers blocking unmuted autoplay; unmute shortly after.
-      pA.mute();
       pA.loadVideoById({ videoId: activeId, startSeconds: YT_START_SECONDS });
       slotVideoIdRef.current[a] = activeId;
-      timeouts.push(
-        window.setTimeout(() => {
-          try {
-            pA.playVideo();
-          } catch {
-            /* */
-          }
-        }, 100),
-      );
-      timeouts.push(
-        window.setTimeout(() => {
-          try {
-            pA.unMute();
-            pA.setVolume(100);
-          } catch {
-            /* */
-          }
-        }, 350),
-      );
-      timeouts.push(
-        window.setTimeout(() => {
-          try {
-            pA.playVideo();
-            pA.unMute();
-            pA.setVolume(100);
-          } catch {
-            /* */
-          }
-        }, 900),
-      );
+      // Aggressive play+unmute chain — user already interacted (clicked Play), so autoplay should work.
+      const forcePlay = () => { try { pA.playVideo(); pA.unMute(); pA.setVolume(100); } catch { /* */ } };
+      timeouts.push(window.setTimeout(forcePlay, 80));
+      timeouts.push(window.setTimeout(forcePlay, 400));
+      timeouts.push(window.setTimeout(forcePlay, 1200));
+      timeouts.push(window.setTimeout(forcePlay, 2500));
     } catch {
       /* */
     }
@@ -294,10 +413,8 @@ function CrystalYouTubeDualStage({
 }
 
 const Crystal = () => {
-  const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
-  const sceneRef = useRef<{ frameId: number } | null>(null);
   const lastHappinessRef = useRef(0.5);
   const smoothedHappinessRef = useRef(0.5);
   const lastHappinessSampleTsRef = useRef(performance.now());
@@ -674,108 +791,12 @@ const Crystal = () => {
   }, []);
 
   useEffect(() => {
-    if (!containerRef.current) return;
-    const container = containerRef.current;
-
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
-    renderer.setSize(container.clientWidth, container.clientHeight);
-    renderer.setClearColor(new THREE.Color(GLOBE_BG), 1);
-    container.appendChild(renderer.domElement);
-
-    const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.1, 100);
-    camera.position.set(0, 0, 2.8);
-
-    scene.add(new THREE.AmbientLight(0x6688bb, 1.2));
-    const dir = new THREE.DirectionalLight(0x88aadd, 0.9);
-    dir.position.set(5, 3, 5);
-    scene.add(dir);
-
-    const loader = new THREE.TextureLoader();
-    const globeMat = new THREE.MeshPhongMaterial({
-      map: null,
-      color: 0x4488cc,
-      emissive: 0x112244,
-      shininess: 20,
-      specular: 0x334466,
-    });
-    loader.load(
-      'https://threejs.org/examples/textures/planets/earth_atmos_2048.jpg',
-      (tex) => {
-        globeMat.map = tex;
-        globeMat.needsUpdate = true;
-      },
-      undefined,
-      () => {}
-    );
-
-    const globe = new THREE.Mesh(new THREE.SphereGeometry(1, 64, 64), globeMat);
-    scene.add(globe);
-
-    const crystalMat = new THREE.MeshPhysicalMaterial({
-      color: 0x88aaff,
-      metalness: 0.05,
-      roughness: 0.05,
-      transmission: 0.95,
-      thickness: 0.5,
-      transparent: true,
-      opacity: 0,
-    });
-    const crystal = new THREE.Mesh(new THREE.SphereGeometry(1.02, 64, 64), crystalMat);
-    crystal.visible = false;
-    scene.add(crystal);
-
-    const state = { frameId: 0, transitionStart: performance.now() };
-    sceneRef.current = state;
-
-    const animate = () => {
-      state.frameId = requestAnimationFrame(animate);
-      const elapsed = performance.now() - state.transitionStart;
-      const t = Math.min(elapsed / TRANSITION_DURATION_MS, 1);
-      const ease = t * t * (3 - 2 * t);
-      globe.scale.setScalar(1 - ease * 0.15);
-      globeMat.opacity = 1 - ease;
-      globeMat.transparent = ease > 0.01;
-      if (ease > 0.02) {
-        crystal.visible = true;
-        crystalMat.opacity = ease * 0.85;
-      }
-      globe.rotation.y += 0.002;
-      crystal.rotation.y += 0.001;
-      renderer.render(scene, camera);
-    };
-    animate();
-
-    const onResize = () => {
-      camera.aspect = container.clientWidth / container.clientHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(container.clientWidth, container.clientHeight);
-    };
-    window.addEventListener('resize', onResize);
-
-    return () => {
-      cancelAnimationFrame(state.frameId);
-      window.removeEventListener('resize', onResize);
-      renderer.dispose();
-      if (container.contains(renderer.domElement)) container.removeChild(renderer.domElement);
-    };
-  }, []);
-
-  useEffect(() => {
     if (cameraOn && modelsLoaded) detectFace();
   }, [cameraOn, modelsLoaded, detectFace]);
 
-  const toggleCamera = async () => {
-    if (cameraOn) {
-      const video = videoRef.current;
-      if (video?.srcObject) {
-        (video.srcObject as MediaStream).getTracks().forEach((t) => t.stop());
-        video.srcObject = null;
-      }
-      setCameraOn(false);
-      return;
-    }
+
+  const startSession = async () => {
+    if (cameraOn) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
       const video = videoRef.current;
@@ -786,21 +807,14 @@ const Crystal = () => {
       smoothedHappinessRef.current = 0.5;
       lastHappinessRef.current = 0.5;
       lastHappinessSampleTsRef.current = performance.now();
+      lastMusicRef.current = Date.now();
       setHappiness(0.5);
       setCameraOn(true);
       setError(null);
-    } catch (e) {
+      playMusicForHappiness(0.5);
+    } catch {
       setError('Camera access denied.');
     }
-  };
-
-  const playSample = () => {
-    setError(null);
-    smoothedHappinessRef.current = 0.6;
-    lastHappinessRef.current = 0.6;
-    lastMusicRef.current = Date.now();
-    setHappiness(0.6);
-    playMusicForHappiness(0.6);
   };
 
   const skipToNextYoutube = useCallback(async () => {
@@ -835,115 +849,166 @@ const Crystal = () => {
     }
     setCameraOn(false);
     setSessionEnded(true);
+
+    if (sessionItems.length > 0) {
+      setArchiveLoading(true);
+      setArchiveError(null);
+      try {
+        const res = await fetch(`${API_BASE}/api/crystal-archive`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionVideos: sessionItems.map((v) => ({
+              videoId: v.videoId,
+              title: v.title,
+              channelTitle: v.channelTitle ?? '',
+            })),
+          }),
+        });
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(json.error || 'Archive failed');
+        setArchiveFilename(json.filename);
+      } catch (e: unknown) {
+        setArchiveError(e instanceof Error ? e.message : 'Archive failed');
+      } finally {
+        setArchiveLoading(false);
+      }
+    }
   };
 
   const showEndModal = sessionEnded;
-  const navigate = useNavigate();
+
+  const sessionActive = cameraOn || currentItem;
+  const isPlaying = !!currentItem;
 
   return (
-    <div ref={containerRef} className="absolute inset-0 w-full h-full" style={{ background: GLOBE_BG }}>
-      <div
-        className={`fixed top-16 right-4 z-[100] w-48 h-48 rounded-lg border-2 border-white/20 shadow-xl overflow-hidden transition-opacity ${
-          cameraOn ? 'opacity-100' : 'opacity-0 pointer-events-none'
-        }`}
-      >
-        <video ref={videoRef} playsInline muted className="absolute inset-0 w-full h-full object-cover rounded-lg" />
-        <canvas
-          ref={overlayCanvasRef}
-          className="absolute inset-0 w-full h-full rounded-lg pointer-events-none"
-          style={{ zIndex: 10 }}
+    <div className="absolute inset-0 w-full h-full">
+      {/* Hidden YouTube player — audio only, no visible embed */}
+      <div className="fixed -left-[9999px] top-0 w-px h-px overflow-hidden" aria-hidden>
+        <CrystalYouTubeDualStage
+          active={currentItem}
+          preload={youtubeQueue[0] ?? null}
+          onError={skipToNextYoutube}
+          onEnded={skipToNextYoutube}
         />
       </div>
 
-      {currentItem?.source === 'youtube' && (
-        <div className="fixed bottom-40 left-1/2 -translate-x-1/2 z-40 w-[min(90vw,320px)] rounded-lg overflow-hidden border border-white/10 transition-opacity duration-300">
-          <CrystalYouTubeDualStage
-            active={currentItem}
-            preload={youtubeQueue[0] ?? null}
-            onError={skipToNextYoutube}
-            onEnded={skipToNextYoutube}
-          />
-        </div>
-      )}
+      {/* Circular RGB audio waveform around the crystal ball */}
+      <div className="absolute inset-0 z-10 pointer-events-none">
+        <CircularWaveCanvas playing={isPlaying} />
+      </div>
 
-      <header className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between px-6 py-4">
-        <button
-          onClick={() => navigate('/')}
-          className="retro-title text-xs text-muted-foreground hover:text-foreground transition-colors"
-        >
-          ← Back
-        </button>
-        <h1 className="retro-title text-sm font-semibold glow-text">Crystal Ball</h1>
-        <div className="w-[60px]" />
-      </header>
-
-      <div className="fixed bottom-0 left-0 right-0 z-50 p-6 pb-10">
+      {/* Webcam — IS the crystal ball. Sized to exactly cover the 3D globe. */}
+      <div className="absolute inset-0 z-15 flex items-center justify-center pointer-events-none">
         <div
-          className="retro-panel mx-auto max-w-md p-4 rounded-lg"
+          className={`relative rounded-full overflow-hidden transition-opacity duration-700 ${
+            cameraOn ? 'opacity-95' : 'opacity-0'
+          }`}
           style={{
-            background: 'rgba(8,12,28,0.9)',
-            backdropFilter: 'blur(16px)',
-            border: '1px solid rgba(0,255,245,0.2)',
+            width: '28vh',
+            height: '28vh',
+            boxShadow: '0 0 60px rgba(0,180,255,0.18), inset 0 0 40px rgba(0,0,0,0.6)',
+            border: '1.5px solid rgba(100,180,255,0.25)',
           }}
         >
-          <div className="flex items-center justify-between mb-3">
-            <span className="retro-title text-[10px] text-muted-foreground">Happiness</span>
-            <span className="retro-title text-[10px] tabular-nums" style={{ color: happiness > 0.6 ? '#4ade80' : happiness < 0.4 ? '#f87171' : '#94a3b8' }}>
-              {Math.round(happiness * 100)}%
-            </span>
-          </div>
-            <div className="h-2 w-full rounded-full bg-white/10 overflow-hidden mb-3">
-            <div
-              className="h-full rounded-full ease-out"
-              style={{
-                width: `${happiness * 100}%`,
-                transition: 'width 2.8s ease-out, background 2.8s ease-out',
-                background: happiness > 0.6 ? 'linear-gradient(90deg,#22c55e,#4ade80)' : happiness < 0.4 ? 'linear-gradient(90deg,#dc2626,#f87171)' : 'linear-gradient(90deg,#64748b,#94a3b8)',
-              }}
-            />
-          </div>
-
-          {error && <p className="retro-body text-xs text-red-400 mb-2">{error}</p>}
-          {currentItem && (
-            <p className="retro-body text-xs text-foreground mb-2 truncate">
-              🎵 {currentItem.title}
-            </p>
-          )}
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center gap-3">
-              <button
-                onClick={toggleCamera}
-                className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-sm retro-title text-xs transition-all ${
-                  cameraOn ? 'bg-red-500/20 text-red-400 border border-red-500/40' : 'bg-accent/20 text-accent border border-accent/40'
-                }`}
-              >
-                {cameraOn ? <VideoOff size={14} /> : <Video size={14} />}
-                {cameraOn ? 'Stop camera' : 'Start camera'}
-              </button>
-              <button
-                onClick={playSample}
-                disabled={loading || !modelsLoaded}
-                className="flex-1 flex items-center justify-center gap-2 py-3 rounded-sm retro-title text-xs bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 hover:bg-emerald-500/30 disabled:opacity-50"
-              >
-                {loading ? <Loader2 size={14} className="animate-spin" /> : <Music size={14} />}
-                Play sample
-              </button>
-            </div>
-            <button
-              onClick={endSession}
-              className="flex items-center justify-center gap-2 px-4 py-3 rounded-sm retro-title text-xs bg-white/10 hover:bg-white/15 border border-white/20"
-            >
-              <Music size={14} />
-              End & save
-            </button>
-          </div>
+          <video ref={videoRef} playsInline muted className="absolute inset-0 w-full h-full object-cover" style={{ transform: 'scaleX(-1)' }} />
+          <canvas
+            ref={overlayCanvasRef}
+            className="absolute inset-0 w-full h-full pointer-events-none"
+            style={{ zIndex: 10, transform: 'scaleX(-1)' }}
+          />
+          <div
+            className="absolute inset-0 rounded-full pointer-events-none"
+            style={{
+              background: 'radial-gradient(ellipse at 30% 25%, rgba(255,255,255,0.15) 0%, transparent 45%), radial-gradient(ellipse at 70% 75%, rgba(0,80,180,0.08) 0%, transparent 50%)',
+            }}
+          />
         </div>
       </div>
 
-      <p className="fixed bottom-24 left-0 right-0 text-center retro-body text-[10px] text-muted-foreground/70 px-4">
-        YouTube · Music matches your face
-      </p>
+      {/* Centered crystal ball HUD — below the ball */}
+      <div className="absolute inset-0 z-20 flex flex-col items-center justify-end pb-[12vh] pointer-events-none">
+        <div
+          className="pointer-events-auto flex flex-col items-center gap-2.5 w-[min(80vw,240px)] p-4"
+          style={{
+            background: 'radial-gradient(circle, rgba(8,12,40,0.5) 0%, transparent 100%)',
+          }}
+        >
+          {/* Now playing */}
+          {currentItem && (
+            <p className="retro-body text-[10px] text-white/50 text-center truncate w-full">
+              🎵 {currentItem.title}
+            </p>
+          )}
 
+          {/* Happiness bar */}
+          {sessionActive && (
+            <div className="w-full space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="retro-title text-[8px] text-white/40">Mood</span>
+                <span
+                  className="retro-title text-[8px] tabular-nums"
+                  style={{ color: happiness > 0.6 ? '#4ade80' : happiness < 0.4 ? '#f87171' : '#94a3b8' }}
+                >
+                  {Math.round(happiness * 100)}%
+                </span>
+              </div>
+              <div className="h-1 w-full rounded-full bg-white/10 overflow-hidden">
+                <div
+                  className="h-full rounded-full"
+                  style={{
+                    width: `${happiness * 100}%`,
+                    transition: 'width 2.8s ease-out, background 2.8s ease-out',
+                    background:
+                      happiness > 0.6
+                        ? 'linear-gradient(90deg,#22c55e,#4ade80)'
+                        : happiness < 0.4
+                          ? 'linear-gradient(90deg,#dc2626,#f87171)'
+                          : 'linear-gradient(90deg,#64748b,#94a3b8)',
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
+          {error && <p className="retro-body text-[10px] text-red-400 text-center">{error}</p>}
+
+          {/* Play / End & Save */}
+          {!cameraOn && !sessionEnded && (
+            <button
+              onClick={startSession}
+              disabled={loading || !modelsLoaded}
+              className="flex items-center justify-center gap-2 px-6 py-2.5 rounded-full retro-title text-[10px] transition-all disabled:opacity-40"
+              style={{
+                background: 'rgba(0,255,245,0.12)',
+                border: '1px solid rgba(0,255,245,0.25)',
+                color: 'rgba(0,255,245,0.9)',
+                boxShadow: '0 0 20px rgba(0,255,245,0.1)',
+              }}
+            >
+              {loading ? <Loader2 size={12} className="animate-spin" /> : <Music size={12} />}
+              {modelsLoaded ? 'Play' : 'Loading…'}
+            </button>
+          )}
+
+          {cameraOn && (
+            <button
+              onClick={endSession}
+              className="flex items-center justify-center gap-2 px-6 py-2.5 rounded-full retro-title text-[10px] transition-all"
+              style={{
+                background: 'rgba(255,255,255,0.08)',
+                border: '1px solid rgba(255,255,255,0.18)',
+                color: 'rgba(255,255,255,0.8)',
+              }}
+            >
+              <Archive size={12} />
+              End & Save
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* End session modal */}
       {showEndModal && (
         <div
           className="fixed inset-0 z-[60] flex items-center justify-center p-6"
@@ -953,65 +1018,41 @@ const Crystal = () => {
             className="retro-panel w-full max-w-md p-6 text-center max-h-[85vh] overflow-y-auto"
             style={{ border: '1px solid rgba(0,255,245,0.3)' }}
           >
-            <p className="retro-title text-sm mb-2">{sessionItems.length > 0 ? 'Session saved' : 'Session ended'}</p>
+            <p className="retro-title text-sm mb-2">
+              {sessionItems.length > 0 ? 'Session saved' : 'Session ended'}
+            </p>
+
+            {archiveLoading && (
+              <div className="flex items-center justify-center gap-2 py-3">
+                <Loader2 className="h-5 w-5 animate-spin text-accent" />
+                <span className="retro-body text-xs text-muted-foreground">Archiving…</span>
+              </div>
+            )}
+            {archiveFilename && (
+              <p className="retro-body text-xs text-green-400/90 mb-3">
+                Archived as <span className="font-mono text-[10px]">{archiveFilename}</span>
+              </p>
+            )}
+            {archiveError && (
+              <p className="retro-body text-xs text-red-400 mb-3">{archiveError}</p>
+            )}
+
             <p className="retro-body text-xs text-muted-foreground mb-4">
               {sessionItems.length > 0
                 ? `${sessionItems.length} video${sessionItems.length === 1 ? '' : 's'} — matching Spotify tracks…`
-                : 'No videos to save'}
+                : 'No videos played.'}
             </p>
 
-            {sessionItems.length > 0 && (
-              <div className="mb-4 space-y-2 text-left">
-                <button
-                  type="button"
-                  onClick={handleArchiveSession}
-                  disabled={archiveLoading}
-                  className="retro-title flex w-full items-center justify-center gap-2 rounded-sm border border-accent/35 bg-accent/10 py-2.5 text-[11px] text-accent transition-opacity hover:bg-accent/15 disabled:opacity-50"
-                >
-                  {archiveLoading ? (
-                    <>
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Archiving…
-                    </>
-                  ) : (
-                    <>
-                      <Archive className="h-4 w-4" />
-                      Archive session
-                    </>
-                  )}
-                </button>
-                <p className="retro-body text-[10px] text-muted-foreground">
-                  Saves this session to the server&apos;s <code className="text-foreground/80">archive/</code> folder as JSON (for a future archive browser).
-                </p>
-                {archiveError && <p className="retro-body text-xs text-red-400">{archiveError}</p>}
-                {archiveFilename && (
-                  <p className="retro-body text-xs text-green-400/90">
-                    Saved as <span className="font-mono text-[10px]">{archiveFilename}</span>
-                  </p>
-                )}
-              </div>
-            )}
-
             {sessionItems.length > 0 && resolveLoading && (
-              <div className="flex flex-col items-center gap-3 py-5">
-                <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-                <div className="retro-body text-xs text-muted-foreground space-y-1 max-w-full">
-                  <p>Contacting Spotify and searching each title (can take ~10–40s for a few videos).</p>
+              <div className="flex flex-col items-center gap-3 py-4">
+                <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                <div className="retro-body text-xs text-muted-foreground space-y-1">
                   {resolveProgress ? (
-                    <>
-                      <p className="text-foreground/90 font-medium tabular-nums">
-                        Matched {resolveProgress.current} of {resolveProgress.total} · {resolveElapsedSec}s elapsed
-                      </p>
-                      {resolveProgress.workingOn ? (
-                        <p className="text-[10px] opacity-80 line-clamp-2" title={resolveProgress.workingOn}>
-                          Last finished: {resolveProgress.workingOn}
-                        </p>
-                      ) : null}
-                    </>
-                  ) : (
-                    <p className="tabular-nums opacity-80">
-                      {resolveElapsedSec}s elapsed — waiting for first result…
+                    <p className="text-foreground/90 tabular-nums">
+                      Matched {resolveProgress.current} of {resolveProgress.total} · {resolveElapsedSec}s
                     </p>
+                  ) : (
+                    <p className="tabular-nums opacity-80">{resolveElapsedSec}s — waiting…</p>
                   )}
                 </div>
               </div>
@@ -1022,25 +1063,15 @@ const Crystal = () => {
             )}
 
             {sessionItems.length > 0 && spotifyMatches && spotifyMatches.length > 0 && (
-              <div className="space-y-3 text-left mb-4 max-h-[min(40vh,280px)] overflow-y-auto pr-1">
-                {resolveLoading && (
-                  <p className="retro-body text-[10px] text-accent/90 mb-1">
-                    Showing matches as they arrive…
-                  </p>
-                )}
+              <div className="space-y-2 text-left mb-4 max-h-[min(40vh,260px)] overflow-y-auto pr-1">
                 {spotifyMatches.map((row, i) => (
                   <div
                     key={`${row.videoId}-${i}`}
-                    className="rounded-md border border-white/10 bg-white/[0.03] p-2.5 space-y-1"
+                    className="rounded-md border border-white/10 bg-white/[0.03] p-2 space-y-0.5"
                   >
-                    <a
-                      href={`https://www.youtube.com/watch?v=${row.videoId}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="block retro-body text-[11px] text-blue-300/90 hover:underline line-clamp-2"
-                    >
+                    <p className="retro-body text-[11px] text-blue-300/90 line-clamp-1">
                       {i + 1}. {row.youtubeTitle}
-                    </a>
+                    </p>
                     {row.spotify ? (
                       <a
                         href={row.spotify.spotify_url}
@@ -1048,14 +1079,10 @@ const Crystal = () => {
                         rel="noopener noreferrer"
                         className="block retro-body text-[11px] text-green-400/90 hover:underline"
                       >
-                        Spotify: {row.spotify.name} — {row.spotify.artist}
+                        {row.spotify.name} — {row.spotify.artist}
                       </a>
                     ) : (
-                      <p className="retro-body text-[10px] text-muted-foreground">
-                        {row.searchQuery?.includes('timed out')
-                          ? 'Skipped — Spotify lookup took too long (not added to playlist)'
-                          : 'No close Spotify match'}
-                      </p>
+                      <p className="retro-body text-[10px] text-muted-foreground">No Spotify match</p>
                     )}
                   </div>
                 ))}
@@ -1068,10 +1095,7 @@ const Crystal = () => {
 
             {playlistResult && (
               <div className="mb-4 rounded-md border border-green-500/30 bg-green-500/10 p-3 text-left">
-                <p className="retro-title text-[10px] text-green-400 mb-2">Playlist created</p>
-                {playlistResult.name && (
-                  <p className="retro-body text-xs text-foreground mb-2">{playlistResult.name}</p>
-                )}
+                <p className="retro-title text-[10px] text-green-400 mb-1">Playlist created</p>
                 <a
                   href={playlistResult.url}
                   target="_blank"
@@ -1092,7 +1116,7 @@ const Crystal = () => {
                   type="button"
                   onClick={handleCreateSpotifyPlaylist}
                   disabled={playlistLoading}
-                  className="retro-title mb-4 w-full rounded-sm py-3 text-[11px] font-semibold transition-opacity disabled:opacity-50"
+                  className="retro-title mb-4 w-full rounded-sm py-2.5 text-[11px] transition-opacity disabled:opacity-50"
                   style={{
                     backgroundColor: 'hsla(var(--spotify-green) / 0.2)',
                     color: 'hsl(var(--spotify-green))',
@@ -1102,22 +1126,12 @@ const Crystal = () => {
                   {playlistLoading ? (
                     <span className="inline-flex items-center justify-center gap-2">
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      Creating playlist…
+                      Creating…
                     </span>
                   ) : (
                     'Create Spotify playlist'
                   )}
                 </button>
-              )}
-
-            {sessionItems.length > 0 &&
-              spotifyMatches &&
-              !resolveLoading &&
-              !spotifyMatches.some((m) => m.spotify) &&
-              !playlistResult && (
-                <p className="retro-body text-xs text-muted-foreground mb-4">
-                  No Spotify matches — try a session with clearer song titles, or add tracks manually in Spotify.
-                </p>
               )}
 
             <button

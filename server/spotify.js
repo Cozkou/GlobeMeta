@@ -3,6 +3,12 @@ const axios = require('axios');
 let accessToken = null;
 let tokenExpiry = null;
 
+/**
+ * Global cooldown: when Spotify sends a long Retry-After (e.g. hours), we skip all
+ * Search API calls until the cooldown expires instead of hammering a banned endpoint.
+ */
+let spotifyCooldownUntil = 0;
+
 /** Max ms per YouTube row for Spotify matching; then skip (no playlist track for that row). */
 const CRYSTAL_SPOTIFY_LOOKUP_MS = Math.max(
   5000,
@@ -48,19 +54,42 @@ async function withTimeout(promise, ms) {
  * Spotify returns 429 when requests burst; respect Retry-After and back off.
  * @param {object} config - axios request config (e.g. `{ headers: { Authorization: 'Bearer …' } }`)
  */
-async function spotifyGet(url, config = {}, { maxRetries = 5 } = {}) {
+async function spotifyGet(url, config = {}, { maxRetries = 2 } = {}) {
+  if (Date.now() < spotifyCooldownUntil) {
+    const remainMin = Math.ceil((spotifyCooldownUntil - Date.now()) / 60000);
+    const err = new Error(`Spotify API cooldown active (${remainMin} min remaining)`);
+    err.response = { status: 429 };
+    throw err;
+  }
+
   let attempt = 0;
   while (true) {
     try {
-      return await axios.get(url, config);
+      return await axios.get(url, { timeout: 8000, ...config });
     } catch (e) {
       const status = e.response?.status;
-      if (status === 429 && attempt < maxRetries) {
+      if (status === 429) {
         const ra = parseInt(e.response?.headers?.['retry-after'], 10);
-        const waitMs = Number.isFinite(ra) && ra > 0 ? ra * 1000 : Math.min(1500 * 2 ** attempt, 12000);
-        await sleep(waitMs);
-        attempt += 1;
-        continue;
+
+        // If Spotify asks us to wait more than 5 minutes, set a global cooldown and stop all requests.
+        if (Number.isFinite(ra) && ra > 300) {
+          spotifyCooldownUntil = Date.now() + ra * 1000;
+          const hrs = (ra / 3600).toFixed(1);
+          console.error(`[Spotify] Hard rate-limit: Retry-After ${ra}s (~${hrs}h). All requests paused until cooldown expires.`);
+          throw e;
+        }
+
+        if (attempt < maxRetries) {
+          const waitMs = Number.isFinite(ra) && ra > 0
+            ? Math.min(ra * 1000, 30000)
+            : Math.min(800 * 2 ** attempt, 16000);
+          console.warn(
+            `[Spotify Web API] 429 rate limit — waiting ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})`,
+          );
+          await sleep(waitMs);
+          attempt += 1;
+          continue;
+        }
       }
       throw e;
     }
@@ -84,6 +113,7 @@ async function getAccessToken() {
         username: process.env.SPOTIFY_CLIENT_ID,
         password: process.env.SPOTIFY_CLIENT_SECRET,
       },
+      timeout: 10000,
     }
   );
 
@@ -172,51 +202,14 @@ function primaryGenreTag(countryCode) {
   return GENRE_TO_SEARCH_TAG[internal] || internal;
 }
 
-/**
- * Several genre/year queries (no country name) so results feel like music from that market,
- * not novelty songs titled after the place.
- */
-function buildSearchQueries(countryCode) {
-  const code = countryCode.toUpperCase();
-  const internal = COUNTRY_GENRES[code] || 'pop';
-  const tag = primaryGenreTag(code);
-  const y = new Date().getFullYear();
-  const y1 = y - 1;
-  const y2 = y - 2;
-
-  /** Keyword search (not “India” the country name as sole query — uses scene + year) */
-  if (internal === 'bollywood') {
-    return [
-      `bollywood year:${y}`,
-      `hindi year:${y}`,
-      `punjabi year:${y1}`,
-    ];
-  }
-
-  const latin = [
-    `genre:${tag} year:${y}`,
-    `genre:reggaeton year:${y}`,
-    `genre:latin-pop year:${y1}`,
-  ];
-  const hiphop = [`genre:${tag} year:${y}`, `genre:rap year:${y1}`, `genre:hip-hop year:${y2}`];
-  const pop = [`genre:pop year:${y}`, `genre:indie year:${y1}`, `genre:dance year:${y}`];
-  const kpop = [`genre:k-pop year:${y}`, `genre:k-pop year:${y1}`,
-  ];
-  const jpop = [`genre:j-pop year:${y}`, `genre:j-pop year:${y1}`,
-  ];
-  const electronic = [`genre:electronic year:${y}`, `genre:house year:${y1}`, `genre:techno year:${y}`];
-  const afro = [`genre:afrobeat year:${y}`, `genre:afrobeat year:${y1}`, `genre:hip-hop year:${y}`];
-
-  if (tag === 'latin') return latin;
-  if (tag === 'hip-hop') return hiphop;
-  if (tag === 'k-pop') return kpop;
-  if (tag === 'j-pop') return jpop;
-  if (tag === 'electronic') return electronic;
-  if (tag === 'afrobeat') return afro;
-  return pop;
-}
-
-async function searchTrackItems(token, q, market, limit, filterCompilations = false) {
+async function searchTrackItems(
+  token,
+  q,
+  market,
+  limit,
+  filterCompilations = false,
+  spotifyGetOptions = {},
+) {
   const requestLimit = filterCompilations ? Math.min(limit * 3, 50) : limit;
   const params = {
     q,
@@ -225,9 +218,13 @@ async function searchTrackItems(token, q, market, limit, filterCompilations = fa
   };
   if (market) params.market = market;
   const url = `https://api.spotify.com/v1/search?` + new URLSearchParams(params);
-  const { data } = await spotifyGet(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const { data } = await spotifyGet(
+    url,
+    {
+      headers: { Authorization: `Bearer ${token}` },
+    },
+    spotifyGetOptions,
+  );
   let items = data.tracks?.items || [];
   if (filterCompilations) {
     items = items.filter(isProperTrack);
@@ -235,8 +232,15 @@ async function searchTrackItems(token, q, market, limit, filterCompilations = fa
   return items.slice(0, limit);
 }
 
-async function searchTracks(token, q, market, limit, filterCompilations = false) {
-  const items = await searchTrackItems(token, q, market, limit, filterCompilations);
+async function searchTracks(
+  token,
+  q,
+  market,
+  limit,
+  filterCompilations = false,
+  spotifyGetOptions = {},
+) {
+  const items = await searchTrackItems(token, q, market, limit, filterCompilations, spotifyGetOptions);
   return items.map(mapTrack).filter(Boolean);
 }
 
@@ -244,45 +248,58 @@ async function searchTracks(token, q, market, limit, filterCompilations = false)
  * Tracks trending in that market: genre + year searches (no country name),
  * merged, deduped, sorted by Spotify popularity.
  */
-const BETWEEN_SEARCH_MS = 180;
+const BETWEEN_SEARCH_MS = 120;
 
+/** Country panel: allow 429 retries with Retry-After (was maxRetries: 0 → instant failure on any throttle). */
+const SPOTIFY_COUNTRY_SEARCH = { maxRetries: 3 };
+
+/**
+ * Globe / country “top tracks”: Spotify Search API only (`api.spotify.com/v1/search`).
+ * Uses **one primary request** per country (was 3+ queries + fallback, which tripped rate limits).
+ */
 async function getTopTracksForCountry(countryCode) {
   const token = await getAccessToken();
   const market = effectiveMarket(countryCode);
-  const queries = buildSearchQueries(countryCode.toUpperCase());
-  const perQuery = 4;
+  const code = countryCode.toUpperCase();
+  const internal = COUNTRY_GENRES[code] || 'pop';
+  const tag = primaryGenreTag(code);
+  const y = new Date().getFullYear();
 
-  // Sequential searches avoid bursting Spotify’s rate limit (parallel calls often yield 429).
-  const batches = [];
-  for (let i = 0; i < queries.length; i += 1) {
-    if (i > 0) await sleep(BETWEEN_SEARCH_MS);
+  const primaryQuery =
+    internal === 'bollywood' ? `bollywood year:${y}` : `genre:${tag} year:${y}`;
+
+  let tracks = [];
+  try {
+    tracks = await searchTracks(token, primaryQuery, market, 15, true, SPOTIFY_COUNTRY_SEARCH);
+  } catch (e) {
+    const st = e.response?.status;
+    console.warn('[Spotify country] primary failed:', primaryQuery.slice(0, 72), st || e.message);
+    if (st === 429) return [];
+  }
+
+  if (tracks.length === 0 && internal !== 'bollywood') {
     try {
-      batches.push(await searchTracks(token, queries[i], market, perQuery, true));
-    } catch {
-      batches.push([]);
+      await sleep(BETWEEN_SEARCH_MS);
+      tracks = await searchTracks(token, `genre:${tag}`, market, 12, true, SPOTIFY_COUNTRY_SEARCH);
+    } catch (e) {
+      const st = e.response?.status;
+      console.warn('[Spotify country] broad genre failed:', st || e.message);
+      if (st === 429) return [];
     }
   }
 
-  let flat = batches.flat();
-  flat = dedupeById(flat);
-  flat.sort((a, b) => b.popularity - a.popularity);
-
-  const out = flat.slice(0, 10).map(({ popularity: _p, ...rest }) => rest);
-
-  if (out.length >= 5) return out;
-
-  // Last resort: single broad genre search in market
-  try {
-    await sleep(BETWEEN_SEARCH_MS);
-    const tag = primaryGenreTag(countryCode);
-    const extra = await searchTracks(token, `genre:${tag}`, market, 10, true);
-    const merged = dedupeById([...flat.map((t) => ({ ...t, popularity: t.popularity ?? 0 })), ...extra]);
-    merged.sort((a, b) => b.popularity - a.popularity);
-    return merged.slice(0, 10).map(({ popularity: _p, ...rest }) => rest);
-  } catch (e) {
-    console.error('getTopTracksForCountry fallback failed:', e.response?.data || e.message);
-    return out;
+  if (tracks.length === 0 && internal === 'bollywood') {
+    try {
+      await sleep(BETWEEN_SEARCH_MS);
+      tracks = await searchTracks(token, `hindi year:${y}`, market, 12, true, SPOTIFY_COUNTRY_SEARCH);
+    } catch (e) {
+      console.warn('[Spotify country] bollywood fallback failed:', e.response?.status || e.message);
+    }
   }
+
+  tracks = dedupeById(tracks);
+  tracks.sort((a, b) => b.popularity - a.popularity);
+  return tracks.slice(0, 10).map(({ popularity: _p, ...rest }) => rest);
 }
 
 async function createPlaylist(name, description, trackUris) {
@@ -602,29 +619,23 @@ async function searchBestTrackForYoutubeTitle(token, market, rawTitle, channelTi
     return true;
   });
 
-  const markets = crystalLookupMarkets(market);
+  const primaryMarket = effectiveMarket((market || 'US').toUpperCase());
   let globalBest = null;
   let globalScore = -1e9;
   let lastGoodQuery = unique[0] || cleaned || '';
 
-  const LIMIT = 20;
-  const EARLY_EXIT_SCORE = 20;
+  const LIMIT = 15;
+  const EARLY_EXIT_SCORE = 18;
+  const MAX_QUERIES = 4;
 
-  for (let j = 0; j < unique.length; j += 1) {
+  const capped = unique.slice(0, MAX_QUERIES);
+
+  for (let j = 0; j < capped.length; j += 1) {
     if (j > 0) await sleep(BETWEEN_SEARCH_MS);
-    const q = unique[j];
-
-    for (let mi = 0; mi < markets.length; mi += 1) {
-      const mkt = markets[mi];
-      if (mi > 0) await sleep(Math.floor(BETWEEN_SEARCH_MS / 2));
-      try {
-        let items = await searchTrackItems(token, q, mkt, LIMIT, false);
-        if (items.length === 0) {
-          await sleep(90);
-          items = await searchTrackItems(token, q, mkt, LIMIT, true);
-        }
-        if (items.length === 0) continue;
-
+    const q = capped[j];
+    try {
+      const items = await searchTrackItems(token, q, primaryMarket, LIMIT, false);
+      if (items.length > 0) {
         const { track, score } = pickBestFromSpotifyApiItems(items, cleaned, channelTitle, parts);
         if (track && score > globalScore) {
           globalScore = score;
@@ -634,23 +645,19 @@ async function searchBestTrackForYoutubeTitle(token, market, rawTitle, channelTi
         if (globalScore >= EARLY_EXIT_SCORE) {
           return { track: globalBest, queryUsed: lastGoodQuery };
         }
-      } catch (e) {
-        console.warn('Spotify search failed for query:', q.slice(0, 80), e.message);
       }
+    } catch (e) {
+      console.warn('Spotify search failed for query:', q.slice(0, 80), e.message);
     }
   }
 
-  if (!globalBest && unique.length > 0) {
-    const q = unique[0];
+  if (!globalBest && capped.length > 0) {
     try {
-      let items = await searchTrackItems(token, q, null, LIMIT, false);
-      if (items.length === 0) {
-        await sleep(90);
-        items = await searchTrackItems(token, q, null, LIMIT, true);
-      }
+      await sleep(BETWEEN_SEARCH_MS);
+      const items = await searchTrackItems(token, capped[0], null, LIMIT, false);
       if (items.length > 0) {
         const { track } = pickBestFromSpotifyApiItems(items, cleaned, channelTitle, parts);
-        if (track) return { track, queryUsed: q };
+        if (track) return { track, queryUsed: capped[0] };
       }
     } catch {
       /* */
@@ -725,6 +732,10 @@ async function resolveCrystalSessionVideosToSpotify(videos, market = 'US') {
   return out;
 }
 
+function getSpotifyCooldownRemaining() {
+  return Math.max(0, spotifyCooldownUntil - Date.now());
+}
+
 module.exports = {
   getTopTracksForCountry,
   createPlaylist,
@@ -732,4 +743,5 @@ module.exports = {
   COUNTRY_GENRES,
   resolveCrystalSessionVideosToSpotify,
   iterateCrystalSpotifyMatches,
+  getSpotifyCooldownRemaining,
 };

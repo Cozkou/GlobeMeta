@@ -117,37 +117,82 @@ interface GlobeProps {
 }
 
 const CAM_DEFAULT = new THREE.Vector3(0, 0, 3.2);
-const CAM_CRYSTAL = new THREE.Vector3(0, 0.5, 3.2);
+const CAM_CRYSTAL = new THREE.Vector3(0, 0.6, 4.2);
 
 function createStand(): THREE.Group {
   const group = new THREE.Group();
-  const standMat = new THREE.MeshPhongMaterial({
-    color: 0x1a1a2e,
-    emissive: 0x0a0a14,
-    shininess: 40,
-    specular: 0x334466,
+
+  const woodMat = new THREE.MeshPhongMaterial({
+    color: 0x3e2723,
+    emissive: 0x1a0e08,
+    shininess: 25,
+    specular: 0x5d4037,
   });
-  const base = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.85, 0.95, 0.12, 32),
-    standMat
-  );
-  base.position.y = -1.35;
+  const darkWoodMat = new THREE.MeshPhongMaterial({
+    color: 0x2c1a10,
+    emissive: 0x100804,
+    shininess: 15,
+    specular: 0x3e2723,
+  });
+  const goldTrim = new THREE.MeshPhongMaterial({
+    color: 0xc9a84c,
+    emissive: 0x4a3a18,
+    shininess: 80,
+    specular: 0xffd700,
+  });
+
+  // Base plate
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.82, 0.92, 0.10, 6), darkWoodMat);
+  base.position.y = -1.38;
   group.add(base);
-  const stem = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.12, 0.18, 0.85, 24),
-    standMat
-  );
-  stem.position.y = -0.92;
+
+  // Gold trim ring on base
+  const baseTrim = new THREE.Mesh(new THREE.TorusGeometry(0.87, 0.025, 12, 6), goldTrim);
+  baseTrim.rotation.x = Math.PI / 2;
+  baseTrim.position.y = -1.33;
+  group.add(baseTrim);
+
+  // Tapered stem
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.16, 0.80, 6), woodMat);
+  stem.position.y = -0.93;
   group.add(stem);
-  const cup = new THREE.Mesh(
-    new THREE.TorusGeometry(0.95, 0.07, 16, 48),
-    standMat
-  );
-  cup.rotation.x = Math.PI / 2;
-  cup.position.y = -0.32;
-  group.add(cup);
+
+  // Cradle — three curved prongs that hold the ball
+  for (let i = 0; i < 3; i++) {
+    const prong = new THREE.Mesh(
+      new THREE.TorusGeometry(0.28, 0.035, 8, 12, Math.PI * 0.6),
+      goldTrim,
+    );
+    prong.rotation.set(Math.PI * 0.25, (i * Math.PI * 2) / 3, 0);
+    prong.position.y = -0.38;
+    group.add(prong);
+  }
+
+  // Rim ring where ball sits
+  const rim = new THREE.Mesh(new THREE.TorusGeometry(0.38, 0.03, 12, 32), goldTrim);
+  rim.rotation.x = Math.PI / 2;
+  rim.position.y = -0.52;
+  group.add(rim);
+
   group.scale.setScalar(0);
   return group;
+}
+
+function createCrystalShell(): THREE.Mesh {
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: 0xaaccff,
+    metalness: 0.0,
+    roughness: 0.05,
+    transmission: 0.92,
+    thickness: 0.3,
+    transparent: true,
+    opacity: 0,
+    side: THREE.FrontSide,
+    envMapIntensity: 0.4,
+  });
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(1.06, 64, 64), mat);
+  mesh.visible = false;
+  return mesh;
 }
 
 const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPanelOpen, crystalBallMode = false }, ref) => {
@@ -159,6 +204,7 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
     controls: OrbitControls;
     globe: THREE.Mesh;
     stand: THREE.Group;
+    crystalShell: THREE.Mesh;
     countryMeshes: THREE.Mesh[];
     countryDataMap: Map<THREE.Mesh, CountryMeshData>;
     raycaster: THREE.Raycaster;
@@ -191,7 +237,7 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
   const handleClick = useCallback(
     (e: MouseEvent) => {
       const s = sceneRef.current;
-      if (!s || !containerRef.current) return;
+      if (!s || !containerRef.current || s.crystalTarget > 0.5) return;
       const rect = containerRef.current.getBoundingClientRect();
       s.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       s.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -243,6 +289,8 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
         emissive: 0x020208,
         shininess: 5,
         specular: 0x111122,
+        transparent: true,
+        opacity: 1,
       })
     );
     scene.add(globe);
@@ -293,6 +341,9 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
     const stand = createStand();
     scene.add(stand);
 
+    const crystalShell = createCrystalShell();
+    scene.add(crystalShell);
+
     const countryGroup = new THREE.Group();
     scene.add(countryGroup);
 
@@ -303,7 +354,7 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
     const mouse = new THREE.Vector2();
 
     const state = {
-      renderer, scene, camera, controls, globe, stand, countryMeshes, countryDataMap,
+      renderer, scene, camera, controls, globe, stand, crystalShell, countryGroup, countryMeshes, countryDataMap,
       raycaster, mouse,
       hoveredCountry: null as CountryMeshData | null,
       frameId: 0,
@@ -461,6 +512,23 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
       const cease = c * c * (3 - 2 * c);
       state.stand.scale.setScalar(cease);
 
+      // Crystal glass shell
+      const shellMat = state.crystalShell.material as THREE.MeshPhysicalMaterial;
+      if (cease > 0.01) {
+        state.crystalShell.visible = true;
+        shellMat.opacity = cease * 0.35;
+      } else {
+        state.crystalShell.visible = false;
+      }
+
+      // Fade the globe surface in crystal mode so the webcam replaces it
+      const surfaceOpacity = 1 - cease * 0.85;
+      (state.globe.material as THREE.MeshPhongMaterial).opacity = surfaceOpacity;
+      state.countryGroup.visible = cease < 0.95;
+
+      // Slower auto-rotate when in crystal mode
+      controls.autoRotateSpeed = 0.4 - cease * 0.25;
+
       // Fly-to animation
       if (state.flyTarget) {
         state.flyProgress += 0.02;
@@ -475,13 +543,13 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
           state.flyTarget = null;
           state.flyProgress = 0;
         }
-      } else {
+      } else if (c > 0.005) {
         camera.position.lerpVectors(CAM_DEFAULT, CAM_CRYSTAL, cease);
         camera.lookAt(0, 0, 0);
       }
 
-      // Raycast hover every 3 frames
-      if (frameCount % 3 === 0 && countryMeshes.length > 0) {
+      // Raycast hover every 3 frames (skip in crystal mode)
+      if (frameCount % 3 === 0 && countryMeshes.length > 0 && state.crystalTarget < 0.5) {
         raycaster.setFromCamera(mouse, camera);
         const hits = raycaster.intersectObjects(countryMeshes);
 
@@ -538,10 +606,10 @@ const GlobeScene = forwardRef<GlobeHandle, GlobeProps>(({ onCountryClick, isPane
   useEffect(() => {
     const s = sceneRef.current;
     if (!s) return;
-    s.controls.autoRotate = !isPanelOpen;
+    s.controls.autoRotate = crystalBallMode || !isPanelOpen;
     s.controls.enabled = true;
     s.controls.enableRotate = true;
-  }, [isPanelOpen]);
+  }, [isPanelOpen, crystalBallMode]);
 
   useEffect(() => {
     const s = sceneRef.current;
