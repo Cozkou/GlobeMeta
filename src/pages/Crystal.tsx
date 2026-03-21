@@ -1,9 +1,9 @@
-import { useRef, useEffect, useState, useCallback, type CSSProperties } from 'react';
+import { useRef, useEffect, useLayoutEffect, useState, useCallback, type CSSProperties } from 'react';
 import { Link, useOutletContext } from 'react-router-dom';
 import type { LayoutContext } from '@/components/AppLayout';
 import * as faceapi from '@vladmandic/face-api';
 import type { Pose } from '@tensorflow-models/pose-detection';
-import { Loader2, Music, Archive } from 'lucide-react';
+import { Loader2, Music, Archive, GripVertical } from 'lucide-react';
 
 /** Circular RGB audio-wave visualizer drawn on a <canvas> right at the crystal ball edge. */
 function CircularWaveCanvas({ playing }: { playing: boolean }) {
@@ -511,6 +511,21 @@ function CrystalYouTubeDualStage({
 type CrystalPlaylistMode = 'mood' | 'romantic' | 'gym';
 type CrystalHudScene = CrystalPlaylistMode;
 
+const CRYSTAL_HUD_POS_KEY = 'globemeta-crystal-hud-pos';
+const HUD_MARGIN = 8;
+const HUD_PANEL_WIDTH = 304;
+
+function clampHudPosition(left: number, top: number, panelEl: HTMLElement | null): { left: number; top: number } {
+  const w = panelEl?.offsetWidth ?? HUD_PANEL_WIDTH;
+  const h = panelEl?.offsetHeight ?? 320;
+  const maxL = Math.max(HUD_MARGIN, window.innerWidth - w - HUD_MARGIN);
+  const maxT = Math.max(HUD_MARGIN, window.innerHeight - h - HUD_MARGIN);
+  return {
+    left: Math.min(maxL, Math.max(HUD_MARGIN, left)),
+    top: Math.min(maxT, Math.max(HUD_MARGIN, top)),
+  };
+}
+
 const Crystal = () => {
   const { crystalPausePlaybackRef } = useOutletContext<LayoutContext>();
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -543,6 +558,93 @@ const Crystal = () => {
   const [archiveLoading, setArchiveLoading] = useState(false);
   const [archiveError, setArchiveError] = useState<string | null>(null);
   const [archiveFilename, setArchiveFilename] = useState<string | null>(null);
+
+  const hudPanelRef = useRef<HTMLDivElement>(null);
+  const [hudPos, setHudPos] = useState<{ left: number; top: number }>(() => {
+    if (typeof window === 'undefined') return { left: HUD_MARGIN, top: HUD_MARGIN };
+    const w = Math.min(window.innerWidth * 0.92, HUD_PANEL_WIDTH);
+    return { left: window.innerWidth - w - 16, top: 12 };
+  });
+  const [hudDragging, setHudDragging] = useState(false);
+  const hudDragRef = useRef<{ startX: number; startY: number; origLeft: number; origTop: number } | null>(null);
+
+  useLayoutEffect(() => {
+    const el = hudPanelRef.current;
+    try {
+      const raw = localStorage.getItem(CRYSTAL_HUD_POS_KEY);
+      if (raw) {
+        const p = JSON.parse(raw) as { left?: number; top?: number };
+        if (typeof p.left === 'number' && typeof p.top === 'number' && Number.isFinite(p.left) && Number.isFinite(p.top)) {
+          setHudPos(clampHudPosition(p.left, p.top, el));
+          return;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    setHudPos((prev) => clampHudPosition(prev.left, prev.top, el));
+  }, []);
+
+  useEffect(() => {
+    const onResize = () => {
+      const el = hudPanelRef.current;
+      setHudPos((prev) => clampHudPosition(prev.left, prev.top, el));
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  useEffect(() => {
+    if (!hudDragging) return;
+    const onMove = (e: PointerEvent) => {
+      const d = hudDragRef.current;
+      if (!d) return;
+      const el = hudPanelRef.current;
+      const dx = e.clientX - d.startX;
+      const dy = e.clientY - d.startY;
+      setHudPos(clampHudPosition(d.origLeft + dx, d.origTop + dy, el));
+    };
+    const onUp = () => {
+      hudDragRef.current = null;
+      setHudDragging(false);
+      const el = hudPanelRef.current;
+      setHudPos((prev) => {
+        const c = clampHudPosition(prev.left, prev.top, el);
+        try {
+          localStorage.setItem(CRYSTAL_HUD_POS_KEY, JSON.stringify(c));
+        } catch {
+          /* ignore */
+        }
+        return c;
+      });
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+  }, [hudDragging]);
+
+  const hudPosRef = useRef(hudPos);
+  useEffect(() => {
+    hudPosRef.current = hudPos;
+  }, [hudPos]);
+
+  const onHudDragHandleDown = useCallback((e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const p = hudPosRef.current;
+    hudDragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      origLeft: p.left,
+      origTop: p.top,
+    };
+    setHudDragging(true);
+  }, []);
 
   const pauseCrystalYoutubePlayback = useCallback(() => {
     setCurrentItem(null);
@@ -999,22 +1101,6 @@ const Crystal = () => {
 
   return (
     <div className="absolute inset-0 w-full h-full pointer-events-none">
-      {/* Page header */}
-      <div className="absolute top-5 left-1/2 -translate-x-1/2 z-30 text-center">
-        <h1
-          className="retro-title text-lg tracking-widest"
-          style={{ color: 'rgba(160,196,240,0.85)', textShadow: '0 2px 12px rgba(0,0,0,0.6)' }}
-        >
-          Crystal Ball
-        </h1>
-        <p
-          className="retro-body text-[11px] mt-1 max-w-[340px]"
-          style={{ color: 'rgba(160,196,240,0.45)' }}
-        >
-          Mood from your face; two people trigger love songs; flex both arms for a gym playlist.
-        </p>
-      </div>
-
       {/* Hidden YouTube player — audio only, no visible embed */}
       <div className="fixed -left-[9999px] top-0 w-px h-px overflow-hidden" aria-hidden>
         <CrystalYouTubeDualStage
@@ -1058,19 +1144,55 @@ const Crystal = () => {
         </div>
       </div>
 
-      {/* Centered crystal ball HUD — below the ball */}
-      <div className="absolute inset-0 z-20 flex flex-col items-center justify-end pb-[16vh] pointer-events-none">
+      {/* Draggable HUD — default top-right; position saved in localStorage */}
+      <div
+        ref={hudPanelRef}
+        className={`pointer-events-auto fixed z-30 flex max-h-[min(92vh,calc(100vh-16px))] min-h-0 w-[min(92vw,304px)] flex-col gap-3 overflow-y-auto overscroll-contain rounded-xl border border-white/[0.1] bg-[rgba(5,9,24,0.9)] p-4 shadow-[0_12px_48px_rgba(0,0,0,0.55)] backdrop-blur-md ${
+          hudDragging ? 'ring-1 ring-cyan-400/30' : ''
+        }`}
+        style={{ left: hudPos.left, top: hudPos.top }}
+      >
         <div
-          className="pointer-events-auto flex flex-col items-center gap-2.5 w-[min(80vw,240px)] p-4"
-          style={{
-            background: 'radial-gradient(circle, rgba(8,12,40,0.5) 0%, transparent 100%)',
-          }}
+          aria-label="Drag to move panel"
+          onPointerDown={onHudDragHandleDown}
+          className="flex shrink-0 cursor-grab select-none items-center gap-2 rounded-md border border-transparent px-1 py-1 -mx-1 -mt-1 touch-none hover:border-white/[0.08] hover:bg-white/[0.04] active:cursor-grabbing"
         >
-          {/* Now playing */}
-          {currentItem && (
-            <p className="retro-body text-[10px] text-white/50 text-center truncate w-full">
-              🎵 {currentItem.title}
+          <GripVertical className="h-4 w-4 shrink-0 text-muted-foreground/55" aria-hidden />
+          <span className="retro-title text-[7px] uppercase tracking-[0.2em] text-muted-foreground/45">Move</span>
+        </div>
+        <header className="shrink-0 space-y-1.5 text-left">
+            <h1
+              className="retro-title text-base tracking-widest sm:text-lg"
+              style={{ color: 'rgba(160,196,240,0.9)', textShadow: '0 2px 12px rgba(0,0,0,0.6)' }}
+            >
+              Crystal Ball
+            </h1>
+            <p className="retro-body text-[10px] leading-relaxed sm:text-[11px]" style={{ color: 'rgba(160,196,240,0.5)' }}>
+              Mood from your face; two people trigger love songs; flex both arms for a gym playlist.
             </p>
+        </header>
+
+        <div className="h-px w-full shrink-0 bg-gradient-to-r from-transparent via-white/[0.12] to-transparent" />
+
+        {/* Now playing */}
+        {currentItem && (
+            <div
+              className="w-full shrink-0 rounded-xl border border-cyan-400/40 bg-[rgba(4,12,28,0.72)] px-3.5 py-3 shadow-[0_0_28px_rgba(34,211,238,0.15),inset_0_1px_0_rgba(255,255,255,0.06)] backdrop-blur-md"
+              role="status"
+              aria-live="polite"
+            >
+              <p className="retro-title mb-1.5 text-left text-[8px] uppercase tracking-[0.22em] text-cyan-200/95">
+                Now playing
+              </p>
+              <p className="retro-body text-left text-[13px] font-semibold leading-snug text-white [text-shadow:0_1px_12px_rgba(0,0,0,0.85)] line-clamp-4">
+                {currentItem.title}
+              </p>
+              {currentItem.channelTitle ? (
+                <p className="retro-body mt-1.5 text-left text-[11px] text-cyan-100/75 line-clamp-2">
+                  {currentItem.channelTitle}
+                </p>
+              ) : null}
+            </div>
           )}
 
           {/* Mood / duo / gym */}
@@ -1122,39 +1244,31 @@ const Crystal = () => {
                     {mood.emoji} {mood.text}
                   </span>
                   <span className="retro-title text-[8px] tabular-nums shrink-0" style={{ color }}>
-                    {Math.round(happiness * 100)}% mood
+                    {Math.round(happiness * 100)}%
                   </span>
                 </div>
-                <p className="retro-body text-[8px] leading-snug text-muted-foreground/70 text-left">
-                  From face expression model + mouth shape. 50% is calm; higher is read as more positive affect.
-                </p>
                 <div className="relative h-2 w-full overflow-hidden rounded-full bg-black/40 ring-1 ring-white/[0.08]">
                   <div
                     className="h-full rounded-full shadow-[0_0_12px_hsla(0,0%,100%,0.12)]"
                     style={{
-                      width: `${happiness * 100}%`,
+                      width: `${Math.max(0, Math.min(1, happiness)) * 100}%`,
                       transition: 'width 0.85s ease-out, background 0.85s ease-out',
                       background: happinessBarStyle(happiness),
                     }}
                   />
                 </div>
-                <div className="flex justify-between retro-title text-[7px] uppercase tracking-wider text-muted-foreground/45">
-                  <span>Low</span>
-                  <span>Balanced</span>
-                  <span>High</span>
-                </div>
               </div>
             );
           })()}
 
-          {error && <p className="retro-body text-[10px] text-red-400 text-center">{error}</p>}
+          {error && <p className="retro-body text-[10px] text-red-400 text-left">{error}</p>}
 
           {/* Play / End & Save */}
           {!cameraOn && !sessionEnded && (
             <button
               onClick={startSession}
               disabled={loading || !modelsLoaded}
-              className="flex items-center justify-center gap-2 px-6 py-2.5 rounded-full retro-title text-[10px] transition-all disabled:opacity-40"
+              className="flex w-full shrink-0 items-center justify-center gap-2 rounded-full px-5 py-2.5 retro-title text-[10px] transition-all disabled:opacity-40"
               style={{
                 background: 'rgba(0,255,245,0.12)',
                 border: '1px solid rgba(0,255,245,0.25)',
@@ -1170,7 +1284,7 @@ const Crystal = () => {
           {cameraOn && (
             <button
               onClick={endSession}
-              className="flex items-center justify-center gap-2 px-6 py-2.5 rounded-full retro-title text-[10px] transition-all"
+              className="flex w-full shrink-0 items-center justify-center gap-2 rounded-full px-5 py-2.5 retro-title text-[10px] transition-all"
               style={{
                 background: 'rgba(255,255,255,0.08)',
                 border: '1px solid rgba(255,255,255,0.18)',
@@ -1181,7 +1295,6 @@ const Crystal = () => {
               End & Save
             </button>
           )}
-        </div>
       </div>
 
       {/* End session modal */}

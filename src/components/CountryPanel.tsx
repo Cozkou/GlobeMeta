@@ -528,16 +528,30 @@ const CountryPanel = ({ countryName, countryCodeHint = null, onClose, isClosing 
                   return (
                     <div
                       key={track.id}
-                      className={`flex items-center gap-2 rounded-lg px-3 py-2.5 transition-colors group ${
-                        isRowActive ? 'bg-white/[0.06]' : 'hover:bg-muted/30'
+                      className={`flex items-center gap-2 rounded-lg px-3 py-2.5 transition-all duration-200 group ${
+                        isRowActive
+                          ? 'bg-[hsl(var(--accent)/0.14)] ring-1 ring-[hsl(var(--accent)/0.45)] shadow-[0_0_20px_hsl(var(--accent)/0.12)] border-l-[3px] border-[hsl(var(--accent))]'
+                          : 'border-l-[3px] border-transparent hover:bg-muted/30'
                       }`}
                     >
-                      <span className="text-xs text-muted-foreground/50 tabular-nums w-4 text-right shrink-0">
+                      <span
+                        className={`text-xs tabular-nums w-4 text-right shrink-0 ${
+                          isRowActive ? 'text-[hsl(var(--accent))] font-semibold' : 'text-muted-foreground/50'
+                        }`}
+                      >
                         {i + 1}
                       </span>
                       <div className="min-w-0 flex-1">
-                        <p className="retro-body text-foreground truncate">{track.name}</p>
-                        <p className="retro-body text-muted-foreground truncate">{track.artist}</p>
+                        <p
+                          className={`retro-body truncate ${isRowActive ? 'text-[15px] font-semibold text-foreground' : 'text-foreground'}`}
+                        >
+                          {track.name}
+                        </p>
+                        <p
+                          className={`retro-body truncate ${isRowActive ? 'text-muted-foreground text-[12px]' : 'text-muted-foreground'}`}
+                        >
+                          {track.artist}
+                        </p>
                       </div>
                       {isRowActive && (!isYoutube || youtubeIsPlaying) && (
                         <SoundWave color="hsl(var(--accent))" />

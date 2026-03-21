@@ -359,11 +359,15 @@ export function ArtistRadioPanel({ open, onClose }: ArtistRadioPanelProps) {
 
         {phase === 'playing' && current && (
           <div className="flex min-h-0 flex-1 flex-col gap-3">
-            <div className="space-y-1">
-              <p className="retro-title text-[9px] uppercase tracking-wider text-muted-foreground">Now · {artistLocked}</p>
-              <p className="retro-body line-clamp-2 text-[12px] text-foreground">{current.title}</p>
+            <div className="space-y-2 rounded-lg border border-[hsl(var(--accent)/0.35)] bg-[hsl(var(--accent)/0.08)] px-3 py-3 shadow-[0_0_22px_hsl(var(--accent)/0.12)]">
+              <p className="retro-title text-[8px] uppercase tracking-[0.18em] text-[hsl(var(--accent)/0.95)]">
+                Now playing · {artistLocked}
+              </p>
+              <p className="retro-body line-clamp-3 text-[14px] font-semibold leading-snug text-foreground">
+                {current.title}
+              </p>
               {current.channelTitle ? (
-                <p className="retro-body text-[10px] text-muted-foreground">{current.channelTitle}</p>
+                <p className="retro-body text-[11px] text-muted-foreground">{current.channelTitle}</p>
               ) : null}
             </div>
 
