@@ -25,3 +25,6 @@ dist-ssr
 
 .env
 server/.env
+
+# Local Crystal session dumps (see POST /api/crystal-archive)
+archive/*.json

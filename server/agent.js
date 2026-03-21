@@ -144,7 +144,8 @@ async function generateYouTubeSearchQuery(text, vibe) {
 Text: "${text}"
 Mood: ${vibe.mood || 'neutral'}, Energy: ${Math.round((vibe.energy || 0.5) * 100)}%, Valence: ${Math.round((vibe.valence || 0.5) * 100)}%
 
-Return ONLY the search query, nothing else. Examples: "upbeat pop music 2024", "calm acoustic guitar", "energetic dance hits".`
+Avoid words that attract playlists, remixes, or covers (do not use: playlist, remix, cover, karaoke, nightcore, mashup, 8d, slowed, mix).
+Return ONLY the search query, nothing else. Examples: "upbeat pop official audio 2024", "calm acoustic guitar official", "energetic dance hits official video".`
     }]
   });
   return response.content[0].text.trim().slice(0, 80) || 'chill music';

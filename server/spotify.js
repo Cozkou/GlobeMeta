@@ -3,8 +3,45 @@ const axios = require('axios');
 let accessToken = null;
 let tokenExpiry = null;
 
+/** Max ms per YouTube row for Spotify matching; then skip (no playlist track for that row). */
+const CRYSTAL_SPOTIFY_LOOKUP_MS = Math.max(
+  5000,
+  parseInt(process.env.CRYSTAL_SPOTIFY_LOOKUP_MS || '22000', 10) || 22000,
+);
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @returns {Promise<{ timedOut: true } | { timedOut: false, value: T }>}
+ */
+async function withTimeout(promise, ms) {
+  let tid;
+  const timeoutP = new Promise((resolve) => {
+    tid = setTimeout(() => resolve({ timedOut: true }), ms);
+  });
+  try {
+    return await Promise.race([
+      promise.then(
+        (value) => {
+          clearTimeout(tid);
+          return { timedOut: false, value };
+        },
+        (err) => {
+          clearTimeout(tid);
+          throw err;
+        },
+      ),
+      timeoutP,
+    ]);
+  } catch (e) {
+    clearTimeout(tid);
+    throw e;
+  }
 }
 
 /**
@@ -179,16 +216,15 @@ function buildSearchQueries(countryCode) {
   return pop;
 }
 
-async function searchTracks(token, q, market, limit, filterCompilations = false) {
+async function searchTrackItems(token, q, market, limit, filterCompilations = false) {
   const requestLimit = filterCompilations ? Math.min(limit * 3, 50) : limit;
-  const url =
-    `https://api.spotify.com/v1/search?` +
-    new URLSearchParams({
-      q,
-      type: 'track',
-      market,
-      limit: String(requestLimit),
-    });
+  const params = {
+    q,
+    type: 'track',
+    limit: String(Math.min(requestLimit, 50)),
+  };
+  if (market) params.market = market;
+  const url = `https://api.spotify.com/v1/search?` + new URLSearchParams(params);
   const { data } = await spotifyGet(url, {
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -196,7 +232,12 @@ async function searchTracks(token, q, market, limit, filterCompilations = false)
   if (filterCompilations) {
     items = items.filter(isProperTrack);
   }
-  return items.slice(0, limit).map(mapTrack).filter(Boolean);
+  return items.slice(0, limit);
+}
+
+async function searchTracks(token, q, market, limit, filterCompilations = false) {
+  const items = await searchTrackItems(token, q, market, limit, filterCompilations);
+  return items.map(mapTrack).filter(Boolean);
 }
 
 /**
@@ -343,15 +384,47 @@ function cleanYoutubeTitleForSearch(raw) {
     /\s*\|\s*vertical\s*video/gi,
     /\s*#\w+/g,
     /\s*•\s*official.*$/i,
+    /\s*[\[(]audio[\])]/gi,
+    /\s*[\[(]full\s*album[\])]/gi,
+    /\s*[\[(]extended\s*(version)?[\])]/gi,
+    /\s*[\[(]radio\s*edit[\])]/gi,
+    /\s*[\[(][^[\]]*remaster(ed)?[^[\]]*[\])]/gi,
+    /\s*[\[(][^[\]]*re-?recorded[^[\]]*[\])]/gi,
+    /\s*[\[(][^[\]]*from\s*["']?[^"']+["']?[\])]/gi,
+    /\s*[\[(]from\s*["']?[^"']+["']?[\])]/gi,
+    /\s*[\[(][^[\]]*\bfeat\.?\s[^[\]]+[\])]/gi,
+    /\s*[\[(][^[\]]*\bft\.?\s[^[\]]+[\])]/gi,
+    /\s*\(\s*feat\.?\s[^)]+\)/gi,
+    /\s*\(\s*ft\.?\s[^)]+\)/gi,
+    /\s*[\[(][^[\]]*\bvs\.?\s[^[\]]+[\])]/gi,
+    /\s*[\[(]live[^[\]]*[\])]/gi,
+    /\s*-\s*live(\s+at\s+[^|-]+)?$/i,
   ];
   for (const re of patterns) s = s.replace(re, ' ');
+  s = s.replace(/\s*feat\.?\s[^|-]+/gi, ' ');
+  s = s.replace(/\s*ft\.?\s[^|-]+/gi, ' ');
   s = s.replace(/\s*-\s*topic\s*$/i, '').trim();
   s = s.replace(/\s+/g, ' ').trim();
   return s.slice(0, 200);
 }
 
 function spotifySearchFragment(s) {
-  return s.replace(/"/g, '').replace(/\s+/g, ' ').trim().slice(0, 100);
+  const t = s.replace(/"/g, ' ').replace(/\s+/g, ' ').trim();
+  if (t.length <= 100) return t;
+  const cut = t.slice(0, 100);
+  const sp = cut.lastIndexOf(' ');
+  return sp > 40 ? cut.slice(0, sp) : cut;
+}
+
+/** For unquoted Spotify field: strip colons / odd chars that break the query */
+function spotifyFieldFragment(s) {
+  return spotifySearchFragment(s).replace(/:/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function crystalLookupMarkets(primary) {
+  const m = effectiveMarket((primary || 'US').toUpperCase());
+  if (m === 'US') return ['US', 'GB'];
+  return [m, 'US'];
 }
 
 /** YouTube channel name is often the recording artist; skip obvious non-artist channels */
@@ -362,10 +435,10 @@ function channelLooksLikeArtist(name) {
   );
 }
 
-/** "Artist - Song" / "Song — Artist" style split (first separator wins) */
+/** "Artist - Song" / "Song — Artist" / "Artist: Song" (first separator wins) */
 function splitYoutubeArtistTitle(cleaned) {
   if (!cleaned || cleaned.length < 4) return null;
-  const seps = [' — ', ' – ', ' - ', ' | ', ' // ', ' / '];
+  const seps = [' — ', ' – ', ' - ', ' | ', ' // ', ' : ', ': '];
   for (const sep of seps) {
     const i = cleaned.indexOf(sep);
     if (i === -1) continue;
@@ -376,43 +449,146 @@ function splitYoutubeArtistTitle(cleaned) {
   return null;
 }
 
+function normalizeMatchStr(s) {
+  return (s || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function significantTokens(s, minLen = 3) {
+  const n = normalizeMatchStr(s);
+  return n.split(/\s+/).filter((w) => w.length >= minLen);
+}
+
 /**
- * Build Spotify search attempts: field queries (track + artist) first, then plain title.
- * Compilation filter is often too strict for chart tracks — try unfiltered first.
+ * Prefer tracks whose name/artist overlap the YouTube title & channel, not only Spotify popularity.
+ */
+function scoreTrackAgainstYoutube(track, cleanedTitle, channelTitle, parts) {
+  if (!track?.name) return -1;
+  const tn = normalizeMatchStr(track.name);
+  const an = normalizeMatchStr(track.artist || '');
+  const ct = normalizeMatchStr(cleanedTitle);
+  const ch = normalizeMatchStr(
+    (channelTitle || '').replace(/\s*-\s*topic\s*$/i, '').trim(),
+  );
+
+  let score = 0;
+  const titleToks = significantTokens(cleanedTitle, 2);
+  for (const w of titleToks) {
+    if (w.length < 2) continue;
+    if (tn.includes(w)) score += 3;
+    if (an.includes(w)) score += 1;
+  }
+  if (ct.length >= 4 && (tn.includes(ct) || ct.includes(tn))) score += 12;
+  if (parts) {
+    const L = normalizeMatchStr(parts.left);
+    const R = normalizeMatchStr(parts.right);
+    if (L.length >= 2 && R.length >= 2) {
+      const leftInArtist = an.includes(L) || L.includes(an) || tokenOverlap(L, an) >= 0.5;
+      const rightInTrack = tn.includes(R) || R.includes(tn) || tokenOverlap(R, tn) >= 0.5;
+      const leftInTrack = tn.includes(L) || L.includes(tn) || tokenOverlap(L, tn) >= 0.5;
+      const rightInArtist = an.includes(R) || R.includes(an) || tokenOverlap(R, an) >= 0.5;
+      if (leftInArtist && rightInTrack) score += 18;
+      if (leftInTrack && rightInArtist) score += 14;
+    }
+  }
+  if (ch.length >= 3) {
+    if (an.includes(ch) || ch.includes(an) || tokenOverlap(ch, an) >= 0.45) score += 10;
+  }
+
+  const junk = /karaoke|nightcore|8d audio|cover band|tribute|chipmunk|slowed\s*\+\s*reverb/i;
+  if (junk.test(track.name) && !junk.test(cleanedTitle)) score -= 25;
+
+  const pop = typeof track.popularity === 'number' ? track.popularity : 0;
+  return score + Math.log1p(pop) * 0.35;
+}
+
+function tokenOverlap(a, b) {
+  const ta = new Set(significantTokens(a, 2));
+  const tb = new Set(significantTokens(b, 2));
+  if (ta.size === 0 || tb.size === 0) return 0;
+  let inter = 0;
+  for (const t of ta) if (tb.has(t)) inter += 1;
+  return inter / Math.min(ta.size, tb.size);
+}
+
+function pickBestFromSpotifyApiItems(items, cleanedTitle, channelTitle, parts) {
+  let best = null;
+  let bestS = -1e9;
+  for (const item of items) {
+    const track = mapTrack(item);
+    if (!track) continue;
+    const s = scoreTrackAgainstYoutube(track, cleanedTitle, channelTitle, parts);
+    if (s > bestS) {
+      bestS = s;
+      best = track;
+    }
+  }
+  if (!best) return { track: null, score: -1e9 };
+  if (bestS < 2) {
+    const mapped = items.map(mapTrack).filter(Boolean);
+    mapped.sort((a, b) => b.popularity - a.popularity);
+    return { track: mapped[0] ?? best, score: bestS };
+  }
+  return { track: best, score: bestS };
+}
+
+/**
+ * Map YouTube title/channel → Spotify: loose field queries first (quoted phrases are brittle),
+ * then channel+title, then plain text; score candidates by overlap with YouTube metadata.
  */
 async function searchBestTrackForYoutubeTitle(token, market, rawTitle, channelTitle = '') {
   const cleaned = cleanYoutubeTitleForSearch(rawTitle);
   const rawTrim = (rawTitle || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  const parts = splitYoutubeArtistTitle(cleaned);
 
   const queries = [];
 
-  const parts = splitYoutubeArtistTitle(cleaned);
   if (parts) {
-    const a0 = spotifySearchFragment(parts.left);
-    const a1 = spotifySearchFragment(parts.right);
+    const a0 = spotifyFieldFragment(parts.left);
+    const a1 = spotifyFieldFragment(parts.right);
+    const q0 = spotifySearchFragment(parts.left);
+    const q1 = spotifySearchFragment(parts.right);
     if (a0 && a1) {
-      // YouTube is usually "Artist - Track"; try that first, then swapped
-      queries.push(`track:"${a1}" artist:"${a0}"`);
-      queries.push(`track:"${a0}" artist:"${a1}"`);
+      queries.push(`track:${a1} artist:${a0}`);
+      queries.push(`track:${a0} artist:${a1}`);
       queries.push(`${a0} ${a1}`);
       queries.push(`${a1} ${a0}`);
+      if (q0 && q1) {
+        queries.push(`track:"${q1}" artist:"${q0}"`);
+        queries.push(`track:"${q0}" artist:"${q1}"`);
+      }
     }
   }
 
   const byMatch = cleaned.match(/^(.+?)\s+by\s+(.+)$/i);
   if (byMatch) {
-    const t = spotifySearchFragment(byMatch[1]);
-    const a = spotifySearchFragment(byMatch[2]);
-    if (t && a) queries.push(`track:"${t}" artist:"${a}"`);
+    const t = spotifyFieldFragment(byMatch[1]);
+    const a = spotifyFieldFragment(byMatch[2]);
+    const tq = spotifySearchFragment(byMatch[1]);
+    const aq = spotifySearchFragment(byMatch[2]);
+    if (t && a) {
+      queries.push(`track:${t} artist:${a}`);
+      if (tq && aq) queries.push(`track:"${tq}" artist:"${aq}"`);
+    }
   }
 
   const chRaw = cleanYoutubeTitleForSearch(channelTitle).replace(/\s*-\s*topic\s*$/i, '').trim();
-  const ch = spotifySearchFragment(chRaw);
-  if (ch && channelLooksLikeArtist(ch) && cleaned.length >= 3) {
-    queries.push(`track:"${spotifySearchFragment(cleaned)}" artist:"${ch}"`);
+  const ch = spotifyFieldFragment(chRaw);
+  const chQ = spotifySearchFragment(chRaw);
+  if (ch && channelLooksLikeArtist(chRaw) && cleaned.length >= 3) {
+    queries.push(`track:${spotifyFieldFragment(cleaned)} artist:${ch}`);
+    queries.push(`${ch} ${spotifyFieldFragment(cleaned)}`);
+    if (chQ) {
+      queries.push(`track:"${spotifySearchFragment(cleaned)}" artist:"${chQ}"`);
+    }
     const beforeParen = cleaned.split('(')[0].trim();
     if (beforeParen.length >= 3 && beforeParen !== cleaned) {
-      queries.push(`track:"${spotifySearchFragment(beforeParen)}" artist:"${ch}"`);
+      queries.push(`track:${spotifyFieldFragment(beforeParen)} artist:${ch}`);
     }
   }
 
@@ -426,62 +602,125 @@ async function searchBestTrackForYoutubeTitle(token, market, rawTitle, channelTi
     return true;
   });
 
+  const markets = crystalLookupMarkets(market);
+  let globalBest = null;
+  let globalScore = -1e9;
+  let lastGoodQuery = unique[0] || cleaned || '';
+
+  const LIMIT = 20;
+  const EARLY_EXIT_SCORE = 20;
+
   for (let j = 0; j < unique.length; j += 1) {
     if (j > 0) await sleep(BETWEEN_SEARCH_MS);
     const q = unique[j];
-    try {
-      let results = await searchTracks(token, q, market, 12, false);
-      if (results.length === 0) {
-        await sleep(BETWEEN_SEARCH_MS / 2);
-        results = await searchTracks(token, q, market, 12, true);
+
+    for (let mi = 0; mi < markets.length; mi += 1) {
+      const mkt = markets[mi];
+      if (mi > 0) await sleep(Math.floor(BETWEEN_SEARCH_MS / 2));
+      try {
+        let items = await searchTrackItems(token, q, mkt, LIMIT, false);
+        if (items.length === 0) {
+          await sleep(90);
+          items = await searchTrackItems(token, q, mkt, LIMIT, true);
+        }
+        if (items.length === 0) continue;
+
+        const { track, score } = pickBestFromSpotifyApiItems(items, cleaned, channelTitle, parts);
+        if (track && score > globalScore) {
+          globalScore = score;
+          globalBest = track;
+          lastGoodQuery = q;
+        }
+        if (globalScore >= EARLY_EXIT_SCORE) {
+          return { track: globalBest, queryUsed: lastGoodQuery };
+        }
+      } catch (e) {
+        console.warn('Spotify search failed for query:', q.slice(0, 80), e.message);
       }
-      if (results.length > 0) {
-        results.sort((a, b) => b.popularity - a.popularity);
-        return { track: results[0], queryUsed: q };
-      }
-    } catch (e) {
-      console.warn('Spotify search failed for query:', q.slice(0, 80), e.message);
     }
   }
-  return { track: null, queryUsed: unique[0] || cleaned || '' };
+
+  if (!globalBest && unique.length > 0) {
+    const q = unique[0];
+    try {
+      let items = await searchTrackItems(token, q, null, LIMIT, false);
+      if (items.length === 0) {
+        await sleep(90);
+        items = await searchTrackItems(token, q, null, LIMIT, true);
+      }
+      if (items.length > 0) {
+        const { track } = pickBestFromSpotifyApiItems(items, cleaned, channelTitle, parts);
+        if (track) return { track, queryUsed: q };
+      }
+    } catch {
+      /* */
+    }
+  }
+
+  return { track: globalBest, queryUsed: lastGoodQuery };
+}
+
+async function resolveCrystalSessionVideoRow(token, v, market = 'US') {
+  try {
+    const raced = await withTimeout(
+      searchBestTrackForYoutubeTitle(token, market, v.title || '', v.channelTitle || ''),
+      CRYSTAL_SPOTIFY_LOOKUP_MS,
+    );
+    if (raced.timedOut) {
+      console.warn(
+        'Crystal Spotify lookup timed out (skipped, not in playlist):',
+        v.videoId,
+        (v.title || '').slice(0, 80),
+      );
+      return {
+        videoId: v.videoId || '',
+        youtubeTitle: v.title || '',
+        searchQuery: '(lookup timed out — skipped)',
+        spotify: null,
+      };
+    }
+    const { track, queryUsed } = raced.value;
+    return {
+      videoId: v.videoId || '',
+      youtubeTitle: v.title || '',
+      searchQuery: queryUsed,
+      spotify: track
+        ? { id: track.id, name: track.name, artist: track.artist, spotify_url: track.spotify_url }
+        : null,
+    };
+  } catch (err) {
+    console.error('resolveCrystal row:', v.videoId, err.message);
+    return {
+      videoId: v.videoId || '',
+      youtubeTitle: v.title || '',
+      searchQuery: '',
+      spotify: null,
+    };
+  }
+}
+
+/**
+ * Yields one { index, total, match } per video for streaming NDJSON progress to the client.
+ */
+async function* iterateCrystalSpotifyMatches(videos, market = 'US') {
+  const token = await getAccessToken();
+  const list = Array.isArray(videos) ? videos.slice(0, 40) : [];
+  const total = list.length;
+  for (let i = 0; i < list.length; i += 1) {
+    if (i > 0) await sleep(BETWEEN_SEARCH_MS);
+    const match = await resolveCrystalSessionVideoRow(token, list[i], market);
+    yield { index: i + 1, total, match };
+  }
 }
 
 /**
  * Map each Crystal session YouTube entry to the best-matching Spotify track (search by title).
  * Sequential requests to respect rate limits.
- * @param {{ videoId: string, title: string }[]} videos
  */
 async function resolveCrystalSessionVideosToSpotify(videos, market = 'US') {
-  const token = await getAccessToken();
   const out = [];
-  const list = Array.isArray(videos) ? videos.slice(0, 40) : [];
-  for (let i = 0; i < list.length; i += 1) {
-    if (i > 0) await sleep(BETWEEN_SEARCH_MS);
-    const v = list[i];
-    try {
-      const { track, queryUsed } = await searchBestTrackForYoutubeTitle(
-        token,
-        market,
-        v.title || '',
-        v.channelTitle || '',
-      );
-      out.push({
-        videoId: v.videoId || '',
-        youtubeTitle: v.title || '',
-        searchQuery: queryUsed,
-        spotify: track
-          ? { id: track.id, name: track.name, artist: track.artist, spotify_url: track.spotify_url }
-          : null,
-      });
-    } catch (err) {
-      console.error('resolveCrystal row:', v.videoId, err.message);
-      out.push({
-        videoId: v.videoId || '',
-        youtubeTitle: v.title || '',
-        searchQuery: '',
-        spotify: null,
-      });
-    }
+  for await (const chunk of iterateCrystalSpotifyMatches(videos, market)) {
+    out.push(chunk.match);
   }
   return out;
 }
@@ -492,4 +731,5 @@ module.exports = {
   getTracksByMood,
   COUNTRY_GENRES,
   resolveCrystalSessionVideosToSpotify,
+  iterateCrystalSpotifyMatches,
 };

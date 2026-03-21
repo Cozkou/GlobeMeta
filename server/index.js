@@ -1,4 +1,6 @@
 const path = require('path');
+const fs = require('fs/promises');
+const crypto = require('crypto');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
 const axios = require('axios');
@@ -8,11 +10,15 @@ const {
   getTracksByMood,
   COUNTRY_GENRES,
   resolveCrystalSessionVideosToSpotify,
+  iterateCrystalSpotifyMatches,
 } = require('./spotify');
 const { parseUserIntent, generatePlaylistDetails, generateReply, analyzeVibe, generateYouTubeSearchQuery, generateCrystalSessionPlaylistDetails } = require('./agent');
 
 const app = express();
 app.use(express.json());
+
+/** Crystal “End & save” dumps — repo root `archive/` (placeholder until a real archive UI exists). */
+const CRYSTAL_ARCHIVE_DIR = path.join(__dirname, '..', 'archive');
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -103,15 +109,70 @@ function isLyricVideo(item) {
   return /\blyric\b|lyrics\s*video/i.test(combined);
 }
 
+/**
+ * Drop playlist-style uploads, remixes, covers, karaoke, and common reupload edits.
+ * (Official re-records like "Taylor's Version" stay allowed.)
+ */
+function isExcludedPlaylistRemixCover(item) {
+  const titleRaw = item.snippet?.title || '';
+  const title = titleRaw.toLowerCase();
+  const desc = (item.snippet?.description || '').toLowerCase().slice(0, 1000);
+  const channel = (item.snippet?.channelTitle || '').toLowerCase();
+  const blob = `${title} ${desc} ${channel}`;
+
+  if (/taylor['’]s\s+version\b/i.test(titleRaw)) return false;
+
+  // Playlist / mega-compilation style videos (still type=video on YouTube)
+  if (
+    /\bplaylist\b|\bplaylists\b|\bfull\s+album\b|\bcomplete\s+album\b|\bentire\s+album\b|\ball\s+songs\b|\bnon-?stop\b|\b\d+\s*hours?\b|\bhours?\s+of\b|\bhour\s+loop\b|\bmega\s+mix\b|\bgreatest\s+hits\b|\bdiscography\b|\bcompilation\b|\bsupercut\b|\b\d+\s*songs?\s+in\b|\btop\s+\d+\s+songs\b|\b100\s+songs\b|\bmix\s*202\d\b/i.test(
+      blob,
+    )
+  ) {
+    return true;
+  }
+
+  // Remixes, edits, meme audio
+  if (
+    /\bremix\b|\brmx\b|\bmash-?up\b|\bmashup\b|\bnightcore\b|\b8d\s+audio\b|\b8d\s+sound\b|\bslowed\s*(down|reverb|\+)?\b|\bsped\s*up\b|\bspeed\s*(up|song)\b|\bfan\s+edit\b|\btik\s*tok\s+version\b|\bvc\b|\bedit\s*audio\b|\bbootleg\b|\bextended\s+mix\b|\bclub\s+mix\b|\bdance\s+mix\b|\bphonk\b|\btype\s+beat\b/i.test(
+      blob,
+    )
+  ) {
+    return true;
+  }
+
+  // Covers, karaoke, tributes, reaction-style
+  if (
+    /\bcover\b|\bcovers\b|\bcovered\s+by\b|\bkaraoke\b|\bpiano\s+cover\b|\bacoustic\s+cover\b|\borchestral\s+cover\b|\bfemale\s+cover\b|\bmale\s+cover\b|\btribute\b|\bnot\s+official\b|\bfan\s+cover\b|\breaction\s+to\b|\breacts\s+to\b|\blive\s+cover\b/i.test(
+      blob,
+    )
+  ) {
+    return true;
+  }
+
+  // Channels that mostly publish non-original audio
+  if (
+    /\b(karaoke|cover|covers|remix|nightcore|mashup|sped\s*up|slowed|8d|instrumental)\b/i.test(channel) &&
+    !/\bvevo\b|\brecords\b|\bmusic\b.*\bofficial\b/i.test(channel)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function isAllowedYoutubeMusicVideo(item) {
+  return Boolean(item?.id?.videoId) && !isExcludedPlaylistRemixCover(item);
+}
+
 function isKeyError(err) {
   const status = err.response?.status;
   const code = err.response?.data?.error?.code;
   return status === 403 || status === 401 || code === 403 || code === 401;
 }
 
-async function youtubeSearch(query, key) {
+async function youtubeSearch(query, key, maxResults = 20) {
   const { data } = await axios.get('https://www.googleapis.com/youtube/v3/search', {
-    params: { part: 'snippet', q: query, type: 'video', maxResults: 15, key },
+    params: { part: 'snippet', q: query, type: 'video', maxResults, key },
   });
   return data;
 }
@@ -138,13 +199,20 @@ app.post('/api/youtube-by-happiness', async (req, res) => {
     if (keys.length === 0) return res.status(503).json({ error: 'YOUTUBE_API_KEY not set' });
 
     const h = Math.max(0, Math.min(1, parseFloat(req.body.happiness) || 0.5));
-    const queries = h > 0.6 ? ['upbeat happy music lyrics', 'feel good pop lyrics', 'joyful songs lyric video'] : h < 0.4 ? ['sad mellow music lyrics', 'calm acoustic lyrics', 'emotional ballads lyric video'] : ['chill music lyrics', 'relaxing pop lyrics', 'neutral vibes lyric video'];
+    const queries =
+      h > 0.6
+        ? ['happy pop official audio', 'feel good songs official music video', 'upbeat hits official audio']
+        : h < 0.4
+          ? ['sad ballad official audio', 'calm acoustic official', 'emotional songs official audio']
+          : ['chill pop official audio', 'relaxing music official', 'easy listening official audio'];
     const query = queries[Math.floor(Math.random() * queries.length)];
 
     const data = await youtubeSearchWithFallback(query);
 
-    const items = (data.items || []).filter((v) => v.id?.videoId && isLyricVideo(v));
-    const videos = (items.length > 0 ? items : data.items || []).slice(0, 5).map((v) => ({
+    const candidates = (data.items || []).filter(isAllowedYoutubeMusicVideo);
+    const lyricItems = candidates.filter(isLyricVideo);
+    const chosen = (lyricItems.length > 0 ? lyricItems : candidates).slice(0, 5);
+    const videos = chosen.map((v) => ({
       videoId: v.id.videoId,
       title: v.snippet?.title || 'Music',
       channelTitle: v.snippet?.channelTitle || '',
@@ -167,10 +235,11 @@ app.post('/api/youtube-by-vibe', async (req, res) => {
     const vibe = await analyzeVibe(req.body.text || 'chill music');
     const query = await generateYouTubeSearchQuery(req.body.text || 'chill music', vibe);
 
-    const data = await youtubeSearchWithFallback(`${query} music lyrics`);
+    const data = await youtubeSearchWithFallback(`${query} official audio`);
 
-    const items = (data.items || []).filter((v) => v.id?.videoId && isLyricVideo(v));
-    const video = items[0] || data.items?.find((v) => v.id?.videoId);
+    const candidates = (data.items || []).filter(isAllowedYoutubeMusicVideo);
+    const lyricItems = candidates.filter(isLyricVideo);
+    const video = lyricItems[0] || candidates[0];
     if (!video?.id?.videoId) {
       return res.status(404).json({ error: 'No video found' });
     }
@@ -229,12 +298,81 @@ app.post('/api/crystal-youtube-to-spotify', async (req, res) => {
       title: String(v.title ?? ''),
       channelTitle: String(v.channelTitle ?? ''),
     }));
-    const matches = await resolveCrystalSessionVideosToSpotify(normalized);
-    res.json({ matches });
+
+    const accept = (req.headers.accept || '').toLowerCase();
+    const wantsJson = accept.includes('application/json') && !accept.includes('application/x-ndjson');
+
+    if (wantsJson) {
+      const matches = await resolveCrystalSessionVideosToSpotify(normalized);
+      return res.json({ matches });
+    }
+
+    res.status(200);
+    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    res.write(`${JSON.stringify({ type: 'start', total: normalized.length })}\n`);
+
+    for await (const chunk of iterateCrystalSpotifyMatches(normalized)) {
+      res.write(
+        `${JSON.stringify({
+          type: 'progress',
+          current: chunk.index,
+          total: chunk.total,
+          workingOn: chunk.match.youtubeTitle,
+          match: chunk.match,
+        })}\n`,
+      );
+    }
+    res.write(`${JSON.stringify({ type: 'done' })}\n`);
+    res.end();
   } catch (err) {
     const detail = err.response?.data || err.message;
     console.error('crystal-youtube-to-spotify:', detail);
-    res.status(500).json({ error: typeof detail === 'string' ? detail : JSON.stringify(detail) });
+    if (!res.headersSent) {
+      return res.status(500).json({ error: typeof detail === 'string' ? detail : JSON.stringify(detail) });
+    }
+    try {
+      res.write(`${JSON.stringify({ type: 'error', error: String(detail) })}\n`);
+    } catch {
+      /* ignore */
+    }
+    res.end();
+  }
+});
+
+app.post('/api/crystal-archive', async (req, res) => {
+  try {
+    const { sessionVideos, spotifyMatches, playlist } = req.body || {};
+    if (!Array.isArray(sessionVideos) || sessionVideos.length === 0) {
+      return res.status(400).json({ error: 'sessionVideos non-empty array required' });
+    }
+    const trimmedVideos = sessionVideos.slice(0, 80).map((v) => ({
+      videoId: String(v.videoId ?? ''),
+      title: String(v.title ?? ''),
+      channelTitle: String(v.channelTitle ?? ''),
+    }));
+    await fs.mkdir(CRYSTAL_ARCHIVE_DIR, { recursive: true });
+    const id = crypto.randomUUID();
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `crystal-${stamp}-${id.slice(0, 8)}.json`;
+    const filepath = path.join(CRYSTAL_ARCHIVE_DIR, filename);
+    const payload = {
+      version: 1,
+      archivedAt: new Date().toISOString(),
+      sessionVideos: trimmedVideos,
+      spotifyMatches: Array.isArray(spotifyMatches) ? spotifyMatches : null,
+      playlist:
+        playlist && typeof playlist === 'object'
+          ? { url: playlist.url ?? null, name: playlist.name ?? null }
+          : null,
+    };
+    await fs.writeFile(filepath, JSON.stringify(payload, null, 2), 'utf8');
+    res.json({ ok: true, filename, id });
+  } catch (err) {
+    console.error('crystal-archive:', err);
+    res.status(500).json({ error: err.message || 'Archive failed' });
   }
 });
 

@@ -2,7 +2,7 @@ import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import * as THREE from 'three';
 import * as faceapi from '@vladmandic/face-api';
 import { useNavigate } from 'react-router-dom';
-import { Video, VideoOff, Loader2, Music } from 'lucide-react';
+import { Video, VideoOff, Loader2, Music, Archive } from 'lucide-react';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 const GLOBE_BG = '#0a0a0f';
@@ -39,7 +39,22 @@ function isSmiling(expressions: Record<string, number>): boolean {
 }
 
 const YT_ERROR_CODES = new Set([2, 5, 100, 101, 150]);
-const YT_START_SECONDS = 90;
+/** Start at 0 — skipping ahead (e.g. 90s) breaks short videos and often triggers “Playback ID” embed errors. */
+const YT_START_SECONDS = 0;
+
+function youtubePlayerVars(): Record<string, number | string> {
+  if (typeof window === 'undefined') {
+    return { autoplay: 0, controls: 1, rel: 0, modestbranding: 1, playsinline: 1 };
+  }
+  return {
+    autoplay: 0,
+    controls: 1,
+    rel: 0,
+    modestbranding: 1,
+    playsinline: 1,
+    origin: window.location.origin,
+  };
+}
 
 type YTPlayerApi = {
   destroy: () => void;
@@ -109,7 +124,7 @@ function CrystalYouTubeDualStage({
         new YT.Player(el, {
           width: '100%',
           height: '100%',
-          playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1 },
+          playerVars: youtubePlayerVars(),
           events: {
             onStateChange: (e) => {
               if (e.data !== 0) return;
@@ -182,16 +197,50 @@ function CrystalYouTubeDualStage({
       return;
     }
 
+    const timeouts: ReturnType<typeof setTimeout>[] = [];
     try {
       pB.pauseVideo();
       pB.mute();
-      pA.unMute();
-      pA.setVolume(100);
+      // Muted load + play first avoids many browsers blocking unmuted autoplay; unmute shortly after.
+      pA.mute();
       pA.loadVideoById({ videoId: activeId, startSeconds: YT_START_SECONDS });
       slotVideoIdRef.current[a] = activeId;
+      timeouts.push(
+        window.setTimeout(() => {
+          try {
+            pA.playVideo();
+          } catch {
+            /* */
+          }
+        }, 100),
+      );
+      timeouts.push(
+        window.setTimeout(() => {
+          try {
+            pA.unMute();
+            pA.setVolume(100);
+          } catch {
+            /* */
+          }
+        }, 350),
+      );
+      timeouts.push(
+        window.setTimeout(() => {
+          try {
+            pA.playVideo();
+            pA.unMute();
+            pA.setVolume(100);
+          } catch {
+            /* */
+          }
+        }, 900),
+      );
     } catch {
       /* */
     }
+    return () => {
+      timeouts.forEach((id) => clearTimeout(id));
+    };
   }, [activeId, playersReady]);
 
   useEffect(() => {
@@ -267,9 +316,18 @@ const Crystal = () => {
   const [spotifyMatches, setSpotifyMatches] = useState<CrystalSpotifyMatch[] | null>(null);
   const [resolveLoading, setResolveLoading] = useState(false);
   const [resolveError, setResolveError] = useState<string | null>(null);
+  const [resolveProgress, setResolveProgress] = useState<{
+    current: number;
+    total: number;
+    workingOn: string;
+  } | null>(null);
+  const [resolveElapsedSec, setResolveElapsedSec] = useState(0);
   const [playlistLoading, setPlaylistLoading] = useState(false);
   const [playlistResult, setPlaylistResult] = useState<{ url: string; name?: string } | null>(null);
   const [playlistError, setPlaylistError] = useState<string | null>(null);
+  const [archiveLoading, setArchiveLoading] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
+  const [archiveFilename, setArchiveFilename] = useState<string | null>(null);
 
   const sessionResolveKey = useMemo(
     () =>
@@ -280,52 +338,129 @@ const Crystal = () => {
   );
 
   useEffect(() => {
+    if (!resolveLoading) {
+      setResolveElapsedSec(0);
+      return;
+    }
+    const t0 = Date.now();
+    const id = window.setInterval(() => {
+      setResolveElapsedSec(Math.floor((Date.now() - t0) / 1000));
+    }, 400);
+    return () => window.clearInterval(id);
+  }, [resolveLoading]);
+
+  useEffect(() => {
     if (!sessionResolveKey) return;
     let cancelled = false;
+    const ac = new AbortController();
     setResolveLoading(true);
     setResolveError(null);
+    setResolveProgress(null);
     setSpotifyMatches(null);
     setPlaylistResult(null);
     setPlaylistError(null);
 
-    fetch(`${API_BASE}/api/crystal-youtube-to-spotify`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        videos: sessionItems.map((v) => ({
-          videoId: v.videoId,
-          title: v.title,
-          channelTitle: v.channelTitle ?? '',
-        })),
-      }),
-    })
-      .then(async (res) => {
-        const text = await res.text();
-        let data: { error?: string; matches?: CrystalSpotifyMatch[] } = {};
-        try {
-          data = JSON.parse(text) as typeof data;
-        } catch {
-          /* ignore */
-        }
+    const videosPayload = sessionItems.map((v) => ({
+      videoId: v.videoId,
+      title: v.title,
+      channelTitle: v.channelTitle ?? '',
+    }));
+
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/crystal-youtube-to-spotify`, {
+          method: 'POST',
+          signal: ac.signal,
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/x-ndjson, application/json;q=0.9',
+          },
+          body: JSON.stringify({ videos: videosPayload }),
+        });
+
+        const ct = res.headers.get('content-type') || '';
+
         if (!res.ok) {
-          throw new Error(
-            typeof data.error === 'string' ? data.error : text.slice(0, 160) || `Server error (${res.status})`,
-          );
+          const text = await res.text();
+          let msg = text.slice(0, 200);
+          try {
+            const j = JSON.parse(text) as { error?: string };
+            if (typeof j.error === 'string') msg = j.error;
+          } catch {
+            /* use text */
+          }
+          throw new Error(msg || `Server error (${res.status})`);
         }
-        return data as { matches: CrystalSpotifyMatch[] };
-      })
-      .then((data) => {
-        if (!cancelled) setSpotifyMatches(data.matches || []);
-      })
-      .catch((e: unknown) => {
+
+        if (ct.includes('application/json')) {
+          const data = (await res.json()) as { matches?: CrystalSpotifyMatch[] };
+          if (!cancelled) setSpotifyMatches(data.matches || []);
+          return;
+        }
+
+        const reader = res.body?.getReader();
+        if (!reader) throw new Error('No response body from server');
+
+        const decoder = new TextDecoder();
+        let buffer = '';
+        const collected: CrystalSpotifyMatch[] = [];
+
+        while (!cancelled) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            let msg: {
+              type?: string;
+              total?: number;
+              current?: number;
+              workingOn?: string;
+              match?: CrystalSpotifyMatch;
+              error?: string;
+            };
+            try {
+              msg = JSON.parse(line) as typeof msg;
+            } catch {
+              continue;
+            }
+            if (msg.type === 'start' && typeof msg.total === 'number') {
+              if (!cancelled) {
+                setResolveProgress({ current: 0, total: msg.total, workingOn: 'Starting…' });
+              }
+            } else if (msg.type === 'progress' && msg.match) {
+              collected.push(msg.match);
+              if (!cancelled) {
+                setSpotifyMatches([...collected]);
+                setResolveProgress({
+                  current: msg.current ?? collected.length,
+                  total: msg.total ?? collected.length,
+                  workingOn: msg.workingOn || msg.match.youtubeTitle || '',
+                });
+              }
+            } else if (msg.type === 'error') {
+              throw new Error(msg.error || 'Match stream failed');
+            }
+          }
+        }
+
+        if (!cancelled) setResolveProgress(null);
+      } catch (e: unknown) {
+        if (cancelled || (e instanceof DOMException && e.name === 'AbortError')) return;
         if (!cancelled) setResolveError(e instanceof Error ? e.message : 'Could not match tracks');
-      })
-      .finally(() => {
-        if (!cancelled) setResolveLoading(false);
-      });
+      } finally {
+        if (!cancelled) {
+          setResolveLoading(false);
+          setResolveProgress(null);
+        }
+      }
+    })();
 
     return () => {
       cancelled = true;
+      ac.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- sessionResolveKey encodes sessionItems
   }, [sessionResolveKey]);
@@ -369,6 +504,7 @@ const Crystal = () => {
     setSpotifyMatches(null);
     setResolveError(null);
     setResolveLoading(false);
+    setResolveProgress(null);
     setPlaylistResult(null);
     setPlaylistError(null);
   }, []);
@@ -824,12 +960,60 @@ const Crystal = () => {
                 : 'No videos to save'}
             </p>
 
-            {sessionItems.length > 0 && resolveLoading && (
-              <div className="flex flex-col items-center gap-3 py-6">
-                <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-                <p className="retro-body text-xs text-muted-foreground">
-                  Finding Spotify songs for each YouTube title…
+            {sessionItems.length > 0 && (
+              <div className="mb-4 space-y-2 text-left">
+                <button
+                  type="button"
+                  onClick={handleArchiveSession}
+                  disabled={archiveLoading}
+                  className="retro-title flex w-full items-center justify-center gap-2 rounded-sm border border-accent/35 bg-accent/10 py-2.5 text-[11px] text-accent transition-opacity hover:bg-accent/15 disabled:opacity-50"
+                >
+                  {archiveLoading ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Archiving…
+                    </>
+                  ) : (
+                    <>
+                      <Archive className="h-4 w-4" />
+                      Archive session
+                    </>
+                  )}
+                </button>
+                <p className="retro-body text-[10px] text-muted-foreground">
+                  Saves this session to the server&apos;s <code className="text-foreground/80">archive/</code> folder as JSON (for a future archive browser).
                 </p>
+                {archiveError && <p className="retro-body text-xs text-red-400">{archiveError}</p>}
+                {archiveFilename && (
+                  <p className="retro-body text-xs text-green-400/90">
+                    Saved as <span className="font-mono text-[10px]">{archiveFilename}</span>
+                  </p>
+                )}
+              </div>
+            )}
+
+            {sessionItems.length > 0 && resolveLoading && (
+              <div className="flex flex-col items-center gap-3 py-5">
+                <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+                <div className="retro-body text-xs text-muted-foreground space-y-1 max-w-full">
+                  <p>Contacting Spotify and searching each title (can take ~10–40s for a few videos).</p>
+                  {resolveProgress ? (
+                    <>
+                      <p className="text-foreground/90 font-medium tabular-nums">
+                        Matched {resolveProgress.current} of {resolveProgress.total} · {resolveElapsedSec}s elapsed
+                      </p>
+                      {resolveProgress.workingOn ? (
+                        <p className="text-[10px] opacity-80 line-clamp-2" title={resolveProgress.workingOn}>
+                          Last finished: {resolveProgress.workingOn}
+                        </p>
+                      ) : null}
+                    </>
+                  ) : (
+                    <p className="tabular-nums opacity-80">
+                      {resolveElapsedSec}s elapsed — waiting for first result…
+                    </p>
+                  )}
+                </div>
               </div>
             )}
 
@@ -837,8 +1021,13 @@ const Crystal = () => {
               <p className="retro-body text-xs text-red-400 mb-4 text-left">{resolveError}</p>
             )}
 
-            {sessionItems.length > 0 && spotifyMatches && !resolveLoading && (
+            {sessionItems.length > 0 && spotifyMatches && spotifyMatches.length > 0 && (
               <div className="space-y-3 text-left mb-4 max-h-[min(40vh,280px)] overflow-y-auto pr-1">
+                {resolveLoading && (
+                  <p className="retro-body text-[10px] text-accent/90 mb-1">
+                    Showing matches as they arrive…
+                  </p>
+                )}
                 {spotifyMatches.map((row, i) => (
                   <div
                     key={`${row.videoId}-${i}`}
@@ -862,7 +1051,11 @@ const Crystal = () => {
                         Spotify: {row.spotify.name} — {row.spotify.artist}
                       </a>
                     ) : (
-                      <p className="retro-body text-[10px] text-muted-foreground">No close Spotify match</p>
+                      <p className="retro-body text-[10px] text-muted-foreground">
+                        {row.searchQuery?.includes('timed out')
+                          ? 'Skipped — Spotify lookup took too long (not added to playlist)'
+                          : 'No close Spotify match'}
+                      </p>
                     )}
                   </div>
                 ))}
