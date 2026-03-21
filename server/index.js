@@ -338,6 +338,72 @@ app.post('/api/youtube-crystal-scene', async (req, res) => {
   }
 });
 
+/**
+ * Random official-style video for an artist (sidebar "Artist shuffle"). Client sends excludeVideoIds for "next".
+ */
+app.post('/api/youtube-random-by-artist', async (req, res) => {
+  try {
+    if (getYoutubeApiKeys().length === 0) return res.status(503).json({ error: 'YOUTUBE_API_KEY not set' });
+
+    const artist = String(req.body?.artist || '').trim();
+    const exclude = new Set(
+      (Array.isArray(req.body?.excludeVideoIds) ? req.body.excludeVideoIds : []).map((id) => String(id)),
+    );
+    if (artist.length < 1 || artist.length > 160) {
+      return res.status(400).json({ error: 'Enter an artist name (1–160 characters).' });
+    }
+
+    const queries = [
+      `${artist} official music video`,
+      `${artist} official audio`,
+      `${artist} live performance`,
+    ];
+
+    const pool = [];
+    const seen = new Set();
+    for (const q of queries) {
+      if (pool.length >= 48) break;
+      try {
+        const data = await youtubeSearchWithFallback(q, 25);
+        for (const item of data.items || []) {
+          const id = item?.id?.videoId;
+          if (!id || seen.has(id) || exclude.has(id)) continue;
+          if (!isAllowedYoutubeMusicVideo(item)) continue;
+          if (isInstrumentalOrLofi(item)) continue;
+          seen.add(id);
+          pool.push({
+            videoId: id,
+            title: item.snippet?.title || 'Video',
+            channelTitle: item.snippet?.channelTitle || '',
+          });
+        }
+      } catch (e) {
+        console.warn('[Artist shuffle] search:', q.slice(0, 50), e.message);
+      }
+    }
+
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+
+    const pick = pool.find((p) => !exclude.has(p.videoId)) || null;
+    if (!pick) {
+      return res.status(404).json({
+        error:
+          exclude.size > 0
+            ? 'No more distinct videos found for that artist. Stop the session and try again, or pick another artist.'
+            : 'No songs found for that artist. Try a different spelling or name.',
+      });
+    }
+
+    res.json({ video: pick, poolHint: pool.length });
+  } catch (err) {
+    console.error('YouTube random-by-artist error:', err.message, err.response?.data);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/youtube-by-vibe', async (req, res) => {
   try {
     const keys = getYoutubeApiKeys();
@@ -1254,42 +1320,104 @@ const BATTLE_COUNTRIES = [
 
 let activeBattle = null;
 const battleVotes = { '1': new Set(), '2': new Set() };
+let battleEndTimeoutId = null;
+
+/** SHOWCASE-BATTLE: short window so results fire quickly. Scheduled battles stay long. */
+const LUFFA_BATTLE_SHOWCASE_MS = Math.max(5000, parseInt(process.env.LUFFA_BATTLE_SHOWCASE_MS || '', 10) || 20_000);
+const LUFFA_BATTLE_SCHEDULED_MS = 2 * 60 * 60 * 1000;
 
 function pickTwoCountries() {
   const shuffled = [...BATTLE_COUNTRIES].sort(() => Math.random() - 0.5);
   return [shuffled[0], shuffled[1]];
 }
 
-async function startCountryBattle() {
+/** Top globe/YouTube pick for Luffa battle winner (uses cache or refreshes). */
+async function getTopTrendingYoutubeForBattleCountry(code, displayName) {
+  const c = String(code || '').toUpperCase();
+  if (!c) return null;
+  try {
+    await Promise.race([
+      refreshCountryData(c),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 28_000)),
+    ]);
+  } catch {
+    /* use globeData[c] if refresh failed */
+  }
+  const data = globeData[c];
+  const top = data?.tracks?.[0];
+  if (top?.youtube_url) {
+    return { url: top.youtube_url, line: `"${top.name}" · ${top.artist || 'YouTube'}`.trim() };
+  }
+  const q = encodeURIComponent(`${displayName || c} music official video`);
+  return {
+    url: `https://www.youtube.com/results?search_query=${q}`,
+    line: `YouTube search · ${displayName || c}`,
+  };
+}
+
+async function buildCountryBattleResultMessage(a, b, v1, v2) {
+  const total = v1 + v2;
+  const countBlock = `Vote count (reply 1 or 2 only, one vote per person):\n· 1 → ${a.flag} ${a.name}: ${v1}\n· 2 → ${b.flag} ${b.name}: ${v2}\n· Total: ${total}`;
+
+  if (total === 0) {
+    return `Poll closed (GlobeMeta)\n\n${a.flag} ${a.name} vs ${b.flag} ${b.name}\n\n${countBlock}\n\nNo replies this round.`;
+  }
+
+  const winner = v1 > v2 ? a : v2 > v1 ? b : null;
+  if (!winner) {
+    return `Poll closed (GlobeMeta)\n\nTie.\n\n${countBlock}`;
+  }
+
+  const trending = await getTopTrendingYoutubeForBattleCountry(winner.code, winner.name);
+  const linkLine = trending ? `\n\nTrending there right now:\n${trending.line}\n${trending.url}` : '';
+
+  return `Poll closed (GlobeMeta)\n\nWinner: ${winner.flag} ${winner.name}\n\n${countBlock}${linkLine}`;
+}
+
+/**
+ * @param {{ durationMs?: number }} [options]
+ */
+async function startCountryBattle(options = {}) {
+  const durationMs =
+    typeof options.durationMs === 'number' && options.durationMs >= 5000
+      ? options.durationMs
+      : LUFFA_BATTLE_SCHEDULED_MS;
+
+  if (battleEndTimeoutId) {
+    clearTimeout(battleEndTimeoutId);
+    battleEndTimeoutId = null;
+  }
+
   const [a, b] = pickTwoCountries();
-  activeBattle = { a, b, startedAt: Date.now() };
+  activeBattle = { a, b, startedAt: Date.now(), durationMs };
   battleVotes['1'].clear();
   battleVotes['2'].clear();
 
-  const msg = `Low stakes poll from GlobeMeta.\n\nWhich side are you feeling?\n${a.flag} reply 1 for ${a.name}\n${b.flag} reply 2 for ${b.name}\n\nOpen for about 2 hours, no pressure.`;
-  console.log(`[Luffa] Country battle started: ${a.name} vs ${b.name}`);
+  const sec = Math.round(durationMs / 1000);
+  const windowHint =
+    durationMs <= 90_000 ? `${sec} seconds` : durationMs <= 3_600_000 ? `${Math.round(sec / 60)} minutes` : 'about 2 hours';
+
+  const msg = `Poll from GlobeMeta — reply with only 1 or 2.\n\n${a.flag} Reply 1 for ${a.name}\n${b.flag} Reply 2 for ${b.name}\n\nOpen for ${windowHint}.`;
+  console.log(`[Luffa] Country battle started: ${a.name} vs ${b.name} (${windowHint})`);
   await broadcastToLuffa(msg);
 
-  // End after 2 hours
-  setTimeout(async () => {
+  battleEndTimeoutId = setTimeout(async () => {
+    battleEndTimeoutId = null;
     if (!activeBattle) return;
+    const { a: aa, b: bb } = activeBattle;
     const v1 = battleVotes['1'].size;
     const v2 = battleVotes['2'].size;
-    const total = v1 + v2;
-    let result;
-    if (total === 0) {
-      result = `Country battle wrap (GlobeMeta)\n\n${a.flag} ${a.name} vs ${b.flag} ${b.name}\n\nQuiet round, no votes this time. All good.`;
-    } else {
-      const winner = v1 > v2 ? a : v2 > v1 ? b : null;
-      if (winner) {
-        result = `Country battle wrap (GlobeMeta)\n\n${winner.flag} ${winner.name} takes it.\n\n${a.flag} ${a.name}: ${v1} vote${v1 !== 1 ? 's' : ''}\n${b.flag} ${b.name}: ${v2} vote${v2 !== 1 ? 's' : ''}\n\n${total} votes total`;
-      } else {
-        result = `Country battle wrap (GlobeMeta)\n\nDead tie.\n\n${a.flag} ${a.name}: ${v1} vote${v1 !== 1 ? 's' : ''}\n${b.flag} ${b.name}: ${v2} vote${v2 !== 1 ? 's' : ''}\n\n${total} votes total`;
-      }
-    }
-    await broadcastToLuffa(result);
     activeBattle = null;
-  }, 2 * 60 * 60 * 1000);
+    try {
+      const result = await buildCountryBattleResultMessage(aa, bb, v1, v2);
+      await broadcastToLuffa(result);
+    } catch (e) {
+      console.error('[Luffa] battle finalize error:', e.message);
+      await broadcastToLuffa(
+        `Poll closed (GlobeMeta)\n\n${aa.flag} ${aa.name}: ${v1} · ${bb.flag} ${bb.name}: ${v2}\n\nCould not load trending link (check server logs).`,
+      );
+    }
+  }, durationMs);
 }
 
 function handleBattleVote(uid, text) {
@@ -1353,7 +1481,7 @@ async function runLuffaShowcaseFeature(kind, uid, isGroup) {
         await sendGlobeAlert();
         break;
       case 'battle':
-        await startCountryBattle();
+        await startCountryBattle({ durationMs: LUFFA_BATTLE_SHOWCASE_MS });
         break;
       case 'playlist':
         await notifyLuffaPlaylistCreated(

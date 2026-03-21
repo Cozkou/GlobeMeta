@@ -1,5 +1,6 @@
 import { useRef, useEffect, useState, useCallback, type CSSProperties } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useOutletContext } from 'react-router-dom';
+import type { LayoutContext } from '@/components/AppLayout';
 import * as faceapi from '@vladmandic/face-api';
 import type { Pose } from '@tensorflow-models/pose-detection';
 import { Loader2, Music, Archive } from 'lucide-react';
@@ -466,6 +467,7 @@ type CrystalPlaylistMode = 'mood' | 'romantic' | 'gym';
 type CrystalHudScene = CrystalPlaylistMode;
 
 const Crystal = () => {
+  const { crystalPausePlaybackRef } = useOutletContext<LayoutContext>();
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const lastHappinessRef = useRef(0.5);
@@ -496,6 +498,18 @@ const Crystal = () => {
   const [archiveLoading, setArchiveLoading] = useState(false);
   const [archiveError, setArchiveError] = useState<string | null>(null);
   const [archiveFilename, setArchiveFilename] = useState<string | null>(null);
+
+  const pauseCrystalYoutubePlayback = useCallback(() => {
+    setCurrentItem(null);
+    setYoutubeQueue([]);
+  }, []);
+
+  useEffect(() => {
+    crystalPausePlaybackRef.current = pauseCrystalYoutubePlayback;
+    return () => {
+      crystalPausePlaybackRef.current = null;
+    };
+  }, [crystalPausePlaybackRef, pauseCrystalYoutubePlayback]);
 
   const handleCreateYouTubePlaylist = useCallback(async () => {
     if (sessionItems.length === 0) return;
