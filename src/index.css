@@ -195,4 +195,22 @@
     50% { background-position: 100% 50%; }
   }
 
+  @keyframes homeHeroFloat {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-4px); }
+  }
+
+  .home-hero-float {
+    animation: homeHeroFloat 7s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .home-hero-float {
+      animation: none;
+    }
+    .home-title-shimmer {
+      animation: none;
+    }
+  }
+
 }

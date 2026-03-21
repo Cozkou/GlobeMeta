@@ -156,31 +156,76 @@ const POSE_EVERY_N_FRAMES = 3;
 /** Smoothed happiness must move this much (0–1) before a new track fetch */
 const HAPPINESS_MUSIC_JUMP_THRESHOLD = 0.18;
 /** ~seconds to settle toward the live face reading (higher = calmer bar) */
-const HAPPINESS_SMOOTH_TIME_CONSTANT_S = 2.5;
+const HAPPINESS_SMOOTH_TIME_CONSTANT_S = 1.85;
 const MAX_HAPPINESS_DT_S = 0.12;
 const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
 
 type YouTubeVideo = { source: 'youtube'; videoId: string; title: string; channelTitle?: string };
 
+/**
+ * Valence weights for face-api softmax probabilities (sum ≈ 1).
+ * Maps to roughly [-1, 1] before normalizing to [0, 1] — matches how strong each read is on camera.
+ */
+const EMOTION_VALENCE: Record<string, number> = {
+  happy: 1,
+  surprised: 0.28,
+  neutral: 0,
+  sad: -0.95,
+  angry: -0.9,
+  fearful: -0.55,
+  disgusted: -0.62,
+};
+
 function happinessFromExpressions(expressions: Record<string, number>): number {
   if (!expressions) return 0.5;
-  const happy = expressions.happy ?? 0;
-  const surprised = expressions.surprised ?? 0;
-  const sad = expressions.sad ?? 0;
-  const angry = expressions.angry ?? 0;
-  const fearful = expressions.fearful ?? 0;
-  const disgusted = expressions.disgusted ?? 0;
-  const positive = happy + surprised * 0.4;
-  const negative = sad + angry * 0.7 + fearful * 0.5 + disgusted * 0.4;
-  return Math.max(0, Math.min(1, 0.5 + positive * 0.5 - negative * 0.5));
+  let v = 0;
+  for (const [key, weight] of Object.entries(EMOTION_VALENCE)) {
+    v += (expressions[key] ?? 0) * weight;
+  }
+  return Math.max(0, Math.min(1, (v + 1) / 2));
+}
+
+/** Mouth width vs height from 68 landmarks — reinforces smile when model under-calls `happy`. */
+function mouthSmileHint(landmarks: faceapi.FaceLandmarks68): number {
+  const p = landmarks.positions;
+  const left = p[48];
+  const right = p[54];
+  const topLip = p[51];
+  const botLip = p[57];
+  const w = Math.hypot(right.x - left.x, right.y - left.y);
+  const h = Math.max(4, Math.hypot(botLip.x - topLip.x, botLip.y - topLip.y));
+  const ratio = w / h;
+  const t = (ratio - 2.15) / 2.65;
+  return Math.max(0, Math.min(1, t));
+}
+
+function happinessFromFace(landmarks: faceapi.FaceLandmarks68 | null, expressions: Record<string, number>): number {
+  const fromExpr = happinessFromExpressions(expressions);
+  if (!landmarks) return fromExpr;
+  const fromMouth = mouthSmileHint(landmarks);
+  return Math.max(0, Math.min(1, fromExpr * 0.78 + fromMouth * 0.22));
 }
 
 function moodLabel(h: number): { text: string; emoji: string } {
-  if (h >= 0.75) return { text: 'Happy', emoji: '😊' };
-  if (h >= 0.6) return { text: 'Upbeat', emoji: '🙂' };
-  if (h <= 0.25) return { text: 'Down', emoji: '😢' };
-  if (h <= 0.4) return { text: 'Mellow', emoji: '😔' };
+  if (h >= 0.72) return { text: 'Bright', emoji: '😊' };
+  if (h >= 0.58) return { text: 'Good', emoji: '🙂' };
+  if (h <= 0.28) return { text: 'Heavy', emoji: '😢' };
+  if (h <= 0.42) return { text: 'Low', emoji: '😔' };
   return { text: 'Neutral', emoji: '😐' };
+}
+
+/** Bar fill color: continuous cool → warm → positive along the 0–1 scale. */
+function happinessBarStyle(h: number): string {
+  const hue = 12 + h * 118;
+  const sat = 72 + h * 12;
+  const light = 48 + h * 14;
+  const hue2 = 18 + h * 105;
+  return `linear-gradient(90deg, hsl(${hue} ${sat}% ${light}%), hsl(${hue2} ${sat + 6}% ${light + 4}%))`;
+}
+
+function happinessLabelColor(h: number): string {
+  const hue = 8 + h * 125;
+  return `hsl(${hue} 78% ${52 + h * 12}%)`;
 }
 
 function isSmiling(expressions: Record<string, number>): boolean {
@@ -775,7 +820,7 @@ const Crystal = () => {
             ctx.stroke();
 
             if (result.expressions) {
-              const raw = happinessFromExpressions(result.expressions);
+              const raw = happinessFromFace(result.landmarks as faceapi.FaceLandmarks68, result.expressions);
               const ts = performance.now();
               const dtS = Math.min(MAX_HAPPINESS_DT_S, (ts - lastHappinessSampleTsRef.current) / 1000);
               lastHappinessSampleTsRef.current = ts;
@@ -1069,31 +1114,34 @@ const Crystal = () => {
           )}
           {sessionActive && crystalHudScene === 'mood' && (() => {
             const mood = moodLabel(happiness);
-            const color = happiness > 0.6 ? '#4ade80' : happiness < 0.4 ? '#f87171' : '#94a3b8';
+            const color = happinessLabelColor(happiness);
             return (
               <div className="w-full space-y-1.5">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2">
                   <span className="retro-title text-[10px]" style={{ color }}>
                     {mood.emoji} {mood.text}
                   </span>
-                  <span className="retro-title text-[8px] tabular-nums" style={{ color }}>
-                    {Math.round(happiness * 100)}%
+                  <span className="retro-title text-[8px] tabular-nums shrink-0" style={{ color }}>
+                    {Math.round(happiness * 100)}% mood
                   </span>
                 </div>
-                <div className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+                <p className="retro-body text-[8px] leading-snug text-muted-foreground/70 text-left">
+                  From face expression model + mouth shape. 50% is calm; higher is read as more positive affect.
+                </p>
+                <div className="relative h-2 w-full overflow-hidden rounded-full bg-black/40 ring-1 ring-white/[0.08]">
                   <div
-                    className="h-full rounded-full"
+                    className="h-full rounded-full shadow-[0_0_12px_hsla(0,0%,100%,0.12)]"
                     style={{
                       width: `${happiness * 100}%`,
-                      transition: 'width 1.5s ease-out, background 1.5s ease-out',
-                      background:
-                        happiness > 0.6
-                          ? 'linear-gradient(90deg,#22c55e,#4ade80)'
-                          : happiness < 0.4
-                            ? 'linear-gradient(90deg,#dc2626,#f87171)'
-                            : 'linear-gradient(90deg,#64748b,#94a3b8)',
+                      transition: 'width 0.85s ease-out, background 0.85s ease-out',
+                      background: happinessBarStyle(happiness),
                     }}
                   />
+                </div>
+                <div className="flex justify-between retro-title text-[7px] uppercase tracking-wider text-muted-foreground/45">
+                  <span>Low</span>
+                  <span>Balanced</span>
+                  <span>High</span>
                 </div>
               </div>
             );
